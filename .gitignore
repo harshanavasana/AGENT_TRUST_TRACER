@@ -1,0 +1,12 @@
+.env
+.gmail-token.json
+token.json
+client_secret*.json
+.venv/
+__pycache__/
+.pytest_cache/
+.agent-trust.sqlite
+.agent-trust.sqlite-shm
+.agent-trust.sqlite-wal
+tracer/policy.yaml
+.streamlit/secrets.toml
