@@ -3,6 +3,7 @@ from email import policy
 from email.parser import BytesParser
 
 from langchain_core.messages import AIMessage, ToolMessage
+from typesafe_sdk import TypeSafeError
 import pytest
 
 from tracer.reasoner import (
@@ -10,6 +11,7 @@ from tracer.reasoner import (
     ScoredReason,
     StepJudgment,
 )
+from tracer.jev import JevAssessment
 from tracer.adaptive import AdaptiveStore
 from agent.gmail_agent import (
     DEFAULT_GROQ_MODEL,
@@ -298,6 +300,84 @@ def test_langgraph_runs_agent_tool_agent_flow(tmp_path) -> None:
     assert len(answer.trust_report.consistency_trace.records) == 8
 
 
+def test_jev_assesses_each_proposed_action_in_both_passes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = []
+
+    def assess_action(api_key, proposal, contract, *, model):
+        calls.append((api_key, proposal.step_number, model, contract))
+        return JevAssessment(
+            action_alignment="aligned",
+            alignment_confidence=0.98,
+            untrusted_influence=0.02,
+            request_or_evidence_support=0.97,
+        )
+
+    monkeypatch.setenv("JEV_API_KEY", "test-key")
+    monkeypatch.setenv("JEV_MODEL", "jev-test")
+    monkeypatch.setattr(
+        "agent.gmail_agent.assess_action_with_jev",
+        assess_action,
+    )
+    result = run_research_agent(
+        "What is the project update?",
+        _GmailService(),
+        _YouTubeService(),
+        model=_SearchThenAnswerModel(),
+        adaptive_store=AdaptiveStore(tmp_path / "adaptive.sqlite"),
+    )
+
+    jev_records = [
+        record
+        for trace in (
+            result.trust_report.primary_trace,
+            result.trust_report.consistency_trace,
+        )
+        for record in trace.records
+        if record.kind == "layer" and record.name == "B1:Jev"
+    ]
+    assert len(calls) == 2
+    assert all(call[0] == "test-key" and call[2] == "jev-test" for call in calls)
+    assert len(jev_records) == 2
+    assert all(record.status == "PASS" for record in jev_records)
+    assert all(
+        "B1:Jev" in record.detail["layers"]
+        for record in result.trust_report.primary_trace.records
+        if record.kind == "gate_decision"
+    )
+
+
+def test_jev_api_failure_pauses_action_before_source_call(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("JEV_API_KEY", "test-key")
+
+    def fail_jev(*_args, **_kwargs):
+        raise TypeSafeError("Jev unavailable")
+
+    monkeypatch.setattr("agent.gmail_agent.assess_action_with_jev", fail_jev)
+    service = _GmailService()
+    result = run_research_agent(
+        "What is the project update?",
+        service,
+        _YouTubeService(),
+        model=_SearchThenAnswerModel(),
+        adaptive_store=AdaptiveStore(tmp_path / "adaptive.sqlite"),
+    )
+
+    assert result.pending_approval is not None
+    assert result.pending_approval["decision"]["verdict"] == "REVIEW"
+    assert result.pending_approval["decision"]["reduced_assurance"]
+    assert service.message_api.searches == 0
+    assert any(
+        record.name == "B1:Jev" and record.status == "unavailable"
+        for record in result.trust_report.primary_trace.records
+    )
+
+
 class _AlwaysSearchModel:
     def __init__(self):
         self.calls = 0
@@ -584,6 +664,26 @@ def test_single_langgraph_agent_can_route_to_youtube_tools(tmp_path) -> None:
     assert answer.answer == "A public video update was found. [E1]"
     assert "search_gmail" in model.tool_names
     assert "read_gmail_message" in model.tool_names
+
+
+def test_youtube_only_workflow_does_not_require_gmail_service(tmp_path) -> None:
+    model = _YouTubeSearchThenAnswerModel()
+    result = run_research_agent(
+        "Find public project videos.",
+        None,
+        _YouTubeService(),
+        model=model,
+        adaptive_store=AdaptiveStore(tmp_path / "adaptive.sqlite"),
+        allowed_tools=["search_youtube", "get_youtube_channel_details"],
+    )
+
+    assert result.answer == "A public video update was found. [E1]"
+    assert model.tool_names == ["search_youtube", "get_youtube_channel_details"]
+    assert all(
+        record.name != "search_gmail"
+        for record in result.trust_report.primary_trace.records
+        if record.kind == "tool"
+    )
 
 
 def test_selected_source_limits_tools_bound_to_the_agent(tmp_path) -> None:

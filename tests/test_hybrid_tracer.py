@@ -63,6 +63,23 @@ class _MockStructuredModel:
         return self.judgment
 
 
+def test_common_mail_word_authorizes_gmail_for_mixed_source_request() -> None:
+    proposal = StepProposal(
+        user_request=(
+            "Find the latest mail I got today and the latest video uploaded "
+            "in T-Series."
+        ),
+        tool_name="search_gmail",
+        arguments={"query": "newer_than:1d"},
+        step_number=1,
+        allowed_tools=["search_gmail", "search_youtube"],
+    )
+
+    rule = evaluate_layer_a(proposal)
+
+    assert rule.status != "FAIL"
+
+
 def test_hard_rule_blocks_unregistered_tool_without_semantic_judge() -> None:
     proposal = StepProposal(
         user_request="Search Gmail for the project",

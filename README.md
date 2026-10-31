@@ -3,15 +3,18 @@
 A local multi-source assistant using LangChain, LangGraph, Groq, Gmail OAuth,
 and the YouTube Data API. A single Groq model routes requests to Gmail and
 public YouTube tools. Gmail uses OAuth; public YouTube search/details use an
-API key.
+API key. Jev provides an additional structured assessment at each
+deterministic-eligible tool decision.
 
 Gmail can search/read messages, create drafts, and send a single-recipient
 email after explicit UI approval of the exact recipient, subject, and body.
 These Gmail operations require the `gmail.readonly` and `gmail.compose` OAuth
 scopes. YouTube access is limited to public video search and public
 video/channel details. The YouTube Data API key does not provide transcripts
-or private account access. Email text, proposed email content, and YouTube
-metadata sent to the agent are forwarded to Groq for processing.
+or private account access. Email text, proposed email content, and YouTube metadata sent to the agent are
+forwarded to Groq for processing. When configured, the proposed action,
+request, contract, and bounded excerpts of prior source evidence are also sent
+to TypeSafe Jev for its per-action assessment.
 
 ## Requirements
 
@@ -19,6 +22,7 @@ metadata sent to the agent are forwarded to Groq for processing.
 - A Google Cloud project with the Gmail API enabled
 - A Google OAuth **Desktop app** client JSON file
 - A Groq API key
+- A TypeSafe API key for Jev
 - A YouTube Data API key with the YouTube Data API v3 enabled
 
 ## Configure credentials
@@ -30,9 +34,11 @@ are ignored by Git.
 ```dotenv
 GOOGLE_OAUTH_CLIENT_FILE=C:\private\client_secret.json
 GROQ_API_KEY=your-groq-api-key
+JEV_API_KEY=your-typesafe-api-key
 YOUTUBE_API_KEY=your-youtube-data-api-key
 # Optional:
 # GROQ_MODEL=openai/gpt-oss-120b
+# JEV_MODEL=jev
 ```
 
 Enable **YouTube Data API v3** in the Google Cloud project that issued the
@@ -47,6 +53,17 @@ To reduce Groq's tokens-per-minute usage, each search is limited to five
 messages, snippets and message bodies are truncated, and at most 5,000
 characters of message text are sent per question. If a 413 quota error occurs,
 narrow the Gmail search/question or wait briefly before retrying.
+Jev is called for every deterministic-eligible proposed tool action, with the
+user request, active tool contract, proposed action, and accumulated source
+evidence. It assesses action alignment, possible influence from untrusted
+source instructions, and whether the action is supported by the request or
+evidence. Its structured
+assessment is recorded as `B1:Jev` and participates in the pre-execution
+decision; uncertainty, a concerning signal, or an API failure pauses the action
+for review. Jev is an evaluator of supplied context, not a retrieval source or
+authority, and it cannot override deterministic rules or the explicit approval
+requirement for Gmail writes. The integration uses TypeSafe's
+[Python SDK](https://docs.typesafe.ai/sdk/python).
 
 In Google Cloud:
 
@@ -144,8 +161,9 @@ The layers are:
 |---|---|
 | A — deterministic | Enforces registered tools, source scope, valid search arguments, YouTube query length, and Gmail read-after-search IDs. A hard failure cannot be overridden by the judge or a baseline. |
 | B — semantic | Uses a low-temperature structured Pydantic judgment for user-intent alignment, causal source, claim support, paraphrased untrusted instructions, unexpected effects, verdict, confidence, and cited step numbers. Tool/email/YouTube text is labeled UNTRUSTED DATA in the judge prompt. Invalid structured output is retried once, then becomes UNKNOWN. |
+| B1 — Jev | Evaluates every proposed action against the trusted request/contract and accumulated evidence using TypeSafe's typed Choice and Noul questions. Misalignment, untrusted-source influence, weak support, uncertainty, or service failure routes the action to review; Jev cannot override deterministic hard failures. |
 | C2 — adaptive baseline | Learns tool order/set, run length, and query-length ranges only from runs explicitly confirmed as good. Deviations can trigger semantic review or REVIEW, never BLOCK by themselves. Stored baseline data contains tool names and numeric lengths, not email/query text. |
-| Fusion | Combines hard rules, semantic verdict, anomaly score, configured thresholds, and risk. It records confidence, layers, latency, token usage, cited evidence, root-cause fields, and recommended action per proposed step. |
+| Fusion | Combines hard rules, Jev assessment, semantic verdict, anomaly score, configured thresholds, and risk. It records confidence, layers, latency, token usage, cited evidence, root-cause fields, and recommended action per proposed step. |
 
 The six post-run checks remain available:
 
@@ -178,7 +196,8 @@ Git.
 
 `tracer/evaluation.py` exposes `LabeledEvaluationCase`,
 `VariantOutcome`, and `ablation_report()` for the variants `rules_only`,
-`rules_plus_judge`, `rules_judge_adaptive`, `final_answer_judge`, and
+`rules_plus_jev`, `rules_plus_judge`, `rules_jev_plus_judge`,
+`rules_judge_adaptive`, `rules_jev_judge_adaptive`, `final_answer_judge`, and
 `whole_trace_judge`. It reports detection, origin/manifestation accuracy,
 false positives (including safe-but-suspicious traces), block/utility rates,
 latency, and token counts. There is no labeled benchmark dataset in this
@@ -199,10 +218,23 @@ executed. Adaptive persistence excludes raw message content.
 The adaptive baseline does not learn recipient domains. Pre/postcondition
 checks do not independently verify Gmail's resulting draft or delivery state.
 
+## Run locally
+
+From the repository root in PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run dashboard\app.py
+```
+
+The dashboard resolves the project root, `.env`, and relative credential paths
+from its own file location, so the same command can also be run with an
+absolute path to `dashboard\app.py` from another working directory.
+
 ## Tests
 
 ```powershell
-python -m pytest tests -q
+.\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
 This app is currently for local desktop OAuth. Hosting it requires a Web

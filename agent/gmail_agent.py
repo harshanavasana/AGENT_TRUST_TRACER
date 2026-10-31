@@ -17,6 +17,7 @@ from typing import Annotated, Any, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import add_messages
+from typesafe_sdk import TypeSafeError
 
 from agent.youtube_tools import build_youtube_tools
 from tracer.adaptive import (
@@ -36,6 +37,7 @@ from tracer.fusion import (
     requires_human_review,
 )
 from tracer.reasoner import judge_step
+from tracer.jev import assess_action_with_jev
 from tracer.trust_checks import (
     ResearchRun,
     RunTrace,
@@ -347,6 +349,8 @@ def build_research_graph(
         )
     )
     config = fusion_config or load_fusion_config()
+    jev_api_key = os.environ.get("JEV_API_KEY")
+    jev_model = os.environ.get("JEV_MODEL", "jev-latest")
     config = FusionConfig(
         high_confidence=adaptive_store.current_threshold(
             "T_high",
@@ -359,6 +363,9 @@ def build_research_graph(
         human_review_confidence=config.human_review_confidence,
         human_review_anomaly=config.human_review_anomaly,
         self_consistency_pass=config.self_consistency_pass,
+        jev_alignment_confidence=config.jev_alignment_confidence,
+        jev_untrusted_influence=config.jev_untrusted_influence,
+        jev_support_minimum=config.jev_support_minimum,
         high_risk_unknown_requires_review=config.high_risk_unknown_requires_review,
         semantic_review_for_high_risk=config.semantic_review_for_high_risk,
     )
@@ -539,6 +546,46 @@ def build_research_graph(
             len(requested_sources(question)) > 1
         )
         judge_error = None
+        jev_assessment = None
+        jev_started = perf_counter()
+        if decision is None and rule.status != "FAIL" and jev_api_key:
+            try:
+                jev_assessment = assess_action_with_jev(
+                    jev_api_key,
+                    proposal,
+                    {
+                        "allowed_tools": active_tools,
+                        "read_only": True,
+                        "sources": sorted(requested_sources(question)),
+                    },
+                    model=jev_model,
+                )
+                jev_status = (
+                    "REVIEW"
+                    if jev_assessment.action_alignment != "aligned"
+                    or jev_assessment.alignment_confidence
+                    < config.jev_alignment_confidence
+                    or jev_assessment.untrusted_influence
+                    >= config.jev_untrusted_influence
+                    or jev_assessment.request_or_evidence_support
+                    < config.jev_support_minimum
+                    else "PASS"
+                )
+                trace.add(
+                    "layer",
+                    "B1:Jev",
+                    jev_status,
+                    (perf_counter() - jev_started) * 1000,
+                    **jev_assessment.as_dict(),
+                )
+            except (TypeSafeError, ImportError, ValueError, KeyError) as error:
+                trace.add(
+                    "layer",
+                    "B1:Jev",
+                    "unavailable",
+                    (perf_counter() - jev_started) * 1000,
+                    error=type(error).__name__,
+                )
         judge_started = perf_counter()
         if decision is None:
             judge = None
@@ -581,6 +628,8 @@ def build_research_graph(
                 risk=risk,
                 anomaly_score=anomaly_score,
                 judge=judge,
+                jev=jev_assessment,
+                jev_required=bool(jev_api_key),
                 config=config,
                 reduced_assurance=judge_error is not None,
                 proposal=proposal,
@@ -607,6 +656,7 @@ def build_research_graph(
                 judge_input_tokens=(decision.judge or {}).get("input_tokens", 0),
                 judge_output_tokens=(decision.judge or {}).get("output_tokens", 0),
                 judge_latency_ms=(decision.judge or {}).get("latency_ms", 0),
+                jev=decision.jev,
                 root_cause=decision.root_cause,
                 proposal={
                     "tool": tool_name,

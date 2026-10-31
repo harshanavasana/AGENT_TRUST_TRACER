@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+project_root_text = str(PROJECT_ROOT)
+if project_root_text not in sys.path:
+    sys.path.insert(0, project_root_text)
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -18,7 +24,59 @@ from agent.youtube_tools import build_youtube_service
 from tracer.adaptive import AdaptiveStore
 from tracer.fusion import load_fusion_config
 
-load_dotenv()
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+_FRIENDLY_TOOL_NAMES = {
+    "search_gmail": "Search Gmail",
+    "read_gmail_message": "Read a Gmail message",
+    "create_gmail_draft": "Create a Gmail draft",
+    "send_gmail_message": "Send a Gmail message",
+    "search_youtube": "Search YouTube",
+    "get_youtube_video_details": "Read YouTube video details",
+    "get_youtube_channel_details": "Read YouTube channel details",
+}
+_DECISION_EXPLANATIONS = {
+    "PASS": "The tracer found this step safe enough to continue.",
+    "REVIEW": "The tracer found something uncertain, so this step should be reviewed.",
+    "FAIL": "The tracer found a serious problem and stopped this step.",
+}
+_JEV_EXPLANATIONS = {
+    "aligned": "Jev agrees that this action matches the request and the allowed source.",
+    "unclear": "Jev could not confidently tell whether this action matches the request.",
+    "misaligned": "Jev found that this action does not match the request or allowed source.",
+}
+
+
+def _friendly_tool_name(tool_name: object) -> str:
+    tool_text = str(tool_name or "unknown action")
+    return _FRIENDLY_TOOL_NAMES.get(tool_text, tool_text.replace("_", " ").capitalize())
+
+
+def _decision_explanation(decision: object) -> str:
+    decision_text = str(decision or "UNKNOWN")
+    return _DECISION_EXPLANATIONS.get(
+        decision_text,
+        "The tracer could not give this step a standard safety result.",
+    )
+
+
+def _jev_explanation(jev: object) -> str:
+    if not isinstance(jev, dict):
+        return "Jev did not provide an assessment for this step."
+    alignment = str(jev.get("action_alignment", "unknown"))
+    explanation = _JEV_EXPLANATIONS.get(
+        alignment,
+        "Jev returned an assessment that needs technical review.",
+    )
+    influence = float(jev.get("untrusted_influence", 0))
+    support = float(jev.get("request_or_evidence_support", 0))
+    if influence >= 0.75:
+        explanation += " It also detected possible influence from source instructions."
+    elif support < 0.3:
+        explanation += " It found little support for this action in the request or evidence."
+    return explanation
+
 
 st.set_page_config(page_title="Source Desk", page_icon="✳", layout="wide")
 st.markdown(
@@ -114,34 +172,70 @@ st.caption(
     "your approval; routine read checks stay with the agent tracer."
 )
 
-client_file = os.environ.get("GOOGLE_OAUTH_CLIENT_FILE", "client_secret.json")
-token_file = os.environ.get("GMAIL_TOKEN_FILE", ".gmail-token.json")
+st.markdown("### What are you looking for?")
+source_mode = st.radio(
+    "Search in",
+    ["Both sources", "Gmail", "YouTube"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="source_mode",
+)
+
+client_file = Path(
+    os.environ.get(
+        "GOOGLE_OAUTH_CLIENT_FILE",
+        str(PROJECT_ROOT / "client_secret.json"),
+    )
+).expanduser()
+token_file = Path(
+    os.environ.get("GMAIL_TOKEN_FILE", str(PROJECT_ROOT / ".gmail-token.json"))
+).expanduser()
+if not client_file.is_absolute():
+    client_file = PROJECT_ROOT / client_file
+if not token_file.is_absolute():
+    token_file = PROJECT_ROOT / token_file
 
 if not os.environ.get("GROQ_API_KEY"):
     st.error("Set GROQ_API_KEY in your local .env file before starting.")
     st.stop()
+if not os.environ.get("JEV_API_KEY"):
+    st.error("Set JEV_API_KEY in your local .env file before starting.")
+    st.stop()
 if not os.environ.get("YOUTUBE_API_KEY"):
     st.error("Set YOUTUBE_API_KEY in your local .env file before starting.")
     st.stop()
-if not Path(client_file).expanduser().is_file():
+client_file_exists = client_file.is_file()
+if source_mode != "YouTube" and not client_file_exists:
     st.error(
         "Set GOOGLE_OAUTH_CLIENT_FILE to the downloaded OAuth Desktop app "
-        "client JSON file. Do not share or commit that file."
+        "client JSON file to search Gmail. Do not share or commit that file."
     )
-    st.stop()
 
 st.sidebar.markdown("### Your workspace")
 st.sidebar.caption("Manage source connections and your local session.")
-if st.sidebar.button("Connect / refresh Gmail", type="primary"):
-    st.session_state["gmail_service"] = build_gmail_service(client_file, token_file)
-    st.sidebar.success("Gmail connected with read and compose access.")
+if client_file_exists:
+    if st.sidebar.button("Connect / refresh Gmail", type="primary"):
+        try:
+            st.session_state["gmail_service"] = build_gmail_service(
+                client_file,
+                token_file,
+            )
+            st.sidebar.success("Gmail connected with read and compose access.")
+        except (OSError, ValueError, RuntimeError) as error:
+            st.sidebar.error(f"Gmail connection failed: {error}")
+else:
+    st.sidebar.caption("Gmail OAuth client is not configured.")
 
 service = st.session_state.get("gmail_service")
-if service is None:
-    st.info("Use **Connect / refresh Gmail** in the sidebar to begin.")
+if service is None and source_mode != "YouTube":
+    st.info("Connect Gmail in the sidebar to search Gmail or both sources.")
     st.stop()
-st.sidebar.markdown("**Connected sources**")
-st.sidebar.markdown("- 🟢 Gmail · private messages")
+st.sidebar.markdown("**Available sources**")
+st.sidebar.markdown(
+    "- 🟢 Gmail · private messages"
+    if service is not None
+    else "- ⚪ Gmail · connect to enable"
+)
 st.sidebar.markdown("- 🟢 YouTube · public videos")
 
 st.session_state.setdefault("research_run", None)
@@ -158,14 +252,6 @@ def set_query(value: str) -> None:
     st.session_state["query_draft"] = value
 
 
-st.markdown("### What are you looking for?")
-source_mode = st.radio(
-    "Search in",
-    ["Both sources", "Gmail", "YouTube"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="source_mode",
-)
 prompt_cols = st.columns(3)
 quick_prompts = [
     "Find the most important email I received today.",
@@ -208,11 +294,12 @@ with st.form("source_search", border=True):
     submit_search = st.form_submit_button(
         "Search sources",
         type="primary",
-        disabled=not question.strip(),
         use_container_width=True,
     )
 
-if submit_search:
+if submit_search and not question.strip():
+    st.warning("Enter a question before searching.")
+elif submit_search:
     scoped_question = {
         "Gmail": f"Use Gmail only. User request: {question}",
         "YouTube": f"Use YouTube only. User request: {question}",
@@ -224,6 +311,18 @@ if submit_search:
                 scoped_question,
                 service,
                 youtube_service,
+                allowed_tools={
+                    "Gmail": [
+                        "search_gmail",
+                        "read_gmail_message",
+                        "create_gmail_draft",
+                        "send_gmail_message",
+                    ],
+                    "YouTube": [
+                        "search_youtube",
+                        "get_youtube_channel_details",
+                    ],
+                }.get(source_mode),
             )
             st.session_state["query_history"] = (
                 st.session_state["query_history"] + [question]
@@ -338,30 +437,52 @@ if report is not None:
         f"{sum(record.duration_ms for record in report.primary_trace.records) / 1000:.1f}s",
     )
 
-    st.markdown("## Hybrid supervisor decisions")
+    st.markdown("## How the tracer checked the agent")
+    st.caption(
+        "Each row is one decision made before the agent used a source. "
+        "The tracer checks whether the action matches your request, looks for "
+        "unsafe instructions in source data, and decides whether to continue, "
+        "pause for review, or stop."
+    )
     if report.hybrid_decisions:
-        for item in report.hybrid_decisions:
+        for decision_index, item in enumerate(report.hybrid_decisions):
             if item.get("mode") == "full_trace_rules":
                 st.caption(
-                    f"Full-trace audit · {item.get('trace')} step "
+                    f"Additional audit · {item.get('trace')} step "
                     f"{item.get('step_number')}: {item.get('decision')} "
                     f"({item.get('rule')})"
                 )
                 continue
+            decision = item.get("decision")
             st.markdown(
-                f"**Step {item.get('root_cause', {}).get('manifestation_step', '?')} · "
-                f"{item.get('tool')} · {item.get('decision')}**"
+                f"**Step {decision_index + 1}: "
+                f"{_friendly_tool_name(item.get('tool'))} · {decision}**"
             )
+            st.write(_decision_explanation(decision))
+            jev = item.get("jev")
+            with st.expander("How Jev helped with this step"):
+                st.write(_jev_explanation(jev))
+                if isinstance(jev, dict):
+                    st.write(
+                        {
+                            "Jev alignment": jev.get("action_alignment"),
+                            "Jev confidence": jev.get("alignment_confidence"),
+                            "Possible unsafe influence": jev.get("untrusted_influence"),
+                            "Request/evidence support": jev.get(
+                                "request_or_evidence_support"
+                            ),
+                        }
+                    )
             st.write(
                 {
-                    "caught_by": item.get("layers", []),
+                    "checks_used": item.get("layers", []),
                     "confidence": item.get("confidence"),
-                    "anomaly_score": item.get("anomaly_score"),
-                    "reduced_assurance": item.get("reduced_assurance", False),
+                    "unusualness_score": item.get("anomaly_score"),
+                    "extra_review_needed": item.get("reduced_assurance", False),
                 }
             )
             if item.get("root_cause"):
-                with st.expander("Root cause and suggested fix"):
+                with st.expander("Technical reason and suggested fix"):
                     st.json(item["root_cause"])
             if (
                 research_run is not None
@@ -369,9 +490,14 @@ if report is not None:
                 and item.get("event_id") is not None
             ):
                 feedback_cols = st.columns(2)
-                step_key = f"{research_run.run_id}-{item['event_id']}"
+                # Event IDs are local to each trace, so the same ID can occur
+                # in the primary and consistency runs. Include the rendered
+                # position to keep every Streamlit widget key unique.
+                step_key = (
+                    f"{research_run.run_id}-{decision_index}-{item['event_id']}"
+                )
                 if feedback_cols[0].button(
-                    "Step verdict correct",
+                    "This decision looks correct",
                     key=f"step-correct-{step_key}",
                 ):
                     adaptive_store.record_feedback(
@@ -383,7 +509,7 @@ if report is not None:
                     )
                     st.success("Step feedback saved without source text.")
                 if feedback_cols[1].button(
-                    "Step verdict incorrect",
+                    "This decision looks incorrect",
                     key=f"step-incorrect-{step_key}",
                 ):
                     adaptive_store.record_feedback(

@@ -64,3 +64,6 @@ def test_ablation_does_not_claim_scores_without_labeled_cases() -> None:
     assert report["status"] == "no_labeled_cases"
     assert report["case_count"] == 0
     assert report["variants"]["rules_only"]["detection_rate"] is None
+    assert report["variants"]["rules_plus_jev"]["detection_rate"] is None
+    assert report["variants"]["rules_jev_plus_judge"]["detection_rate"] is None
+    assert report["variants"]["rules_jev_judge_adaptive"]["detection_rate"] is None

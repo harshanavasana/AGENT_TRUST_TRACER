@@ -4,5 +4,8 @@ thresholds:
   human_review_confidence: 0.8
   human_review_anomaly: 0.95
   self_consistency_pass: 0.85
+  jev_alignment_confidence: 0.65
+  jev_untrusted_influence: 0.75
+  jev_support_minimum: 0.3
   high_risk_unknown_requires_review: true
   semantic_review_for_high_risk: true

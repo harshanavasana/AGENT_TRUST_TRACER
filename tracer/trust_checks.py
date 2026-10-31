@@ -341,7 +341,12 @@ def _precondition_check(trace: RunTrace) -> TrustCheck:
 
 def _requested_sources(question: str) -> set[str]:
     normalized = question.casefold()
-    gmail_requested = bool(re.search(r"\b(gmail|email|emails|inbox)\b", normalized))
+    gmail_requested = bool(
+        re.search(
+            r"\b(gmail|email|emails|mail|mails|message|messages|inbox)\b",
+            normalized,
+        )
+    )
     youtube_requested = bool(
         re.search(r"\b(youtube|video|videos|channel|channels)\b", normalized)
     )

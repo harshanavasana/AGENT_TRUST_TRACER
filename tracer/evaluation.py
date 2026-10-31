@@ -8,8 +8,11 @@ from typing import Any
 
 VARIANTS = (
     "rules_only",
+    "rules_plus_jev",
     "rules_plus_judge",
+    "rules_jev_plus_judge",
     "rules_judge_adaptive",
+    "rules_jev_judge_adaptive",
     "final_answer_judge",
     "whole_trace_judge",
 )
