@@ -90,6 +90,7 @@ From the project directory, run:
 
 ```powershell
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 python -m streamlit run dashboard/app.py
 ```
 
@@ -112,6 +113,58 @@ The Source Desk dashboard provides a source selector, starter questions, and
 recent searches. Selecting Gmail or YouTube binds only that source's tools to
 the agent for the run; **Both sources** leaves both available. Results include
 the trust report, run metrics, and expandable trace details.
+
+The dashboard also supports browser voice recognition in supported browsers.
+Select **Start voice command**, allow microphone access, and say a natural
+language request such as “open YouTube” or “find my project email”. The
+transcript is placed in the normal command box, so submitting it uses the same
+traced agent workflow as typed input. “Open YouTube” and “open Gmail” use
+fixed, safe destinations and provide an explicit **Open** button. While a run
+is active, **Stop tracer** records why execution was stopped, preserves the
+trace for review, and provides a link to the relevant destination. Completed
+runs return to the dashboard and display the existing metrics and trust checks.
+Speech recognition is supplied by the browser; Chrome or Edge over localhost
+is recommended.
+
+## Voice assistant
+
+The Voice panel records an ephemeral microphone clip, sends it to Groq Whisper
+(`whisper-large-v3-turbo`), and places the editable transcript in the same
+trusted command box used for typed requests. Replies can be spoken with Groq
+Orpheus (`canopylabs/orpheus-v1-english`), with `edge-tts`, `pyttsx3`, and
+text-only fallbacks. Optional settings are:
+
+With **Auto-run voice commands** enabled, a transcript of at least two words
+starts the same traced agent pipeline automatically; disable it to edit and
+confirm first. Each run has a durable metrics URL (`?run=<run_id>&view=metrics`)
+with its timeline, trust decisions, and post-run checks. The auto-run guard
+hashes each recording so Streamlit reruns do not execute it twice.
+
+```dotenv
+GROQ_STT_MODEL=whisper-large-v3-turbo
+GROQ_TTS_MODEL=canopylabs/orpheus-v1-english
+GROQ_TTS_VOICE=hannah
+# Optional: GROQ_STT_LANGUAGE=en
+```
+
+Example commands: “Get me the latest song of Taylor Swift”, “Check my latest
+emails”, and “Find videos about LangGraph tutorials”. Sending email always
+pauses for on-screen approval of the exact recipient, subject, and body;
+speaking “yes” cannot approve it. Voice audio and spoken-reply text are sent
+to Groq for processing. Raw audio is not stored by the application. Browser
+opening happens on the machine running Streamlit; use the in-app player when
+hosting remotely. Microphone permissions, API quotas, unavailable results, and
+optional local TTS engines can prevent voice output without preventing the
+normal text workflow.
+
+When browser actions are enabled, Playwright uses a headed Chromium profile in
+`.browser_profile` and only visits fixed YouTube/Gmail destinations. Install it
+with `python -m pip install playwright` followed by
+`python -m playwright install chromium`. It never types passwords or clicks
+send, purchase, delete, or confirmation controls. Set `DASHBOARD_URL` when the
+dashboard is not at `http://localhost:8501`. Returning to the metrics URL is
+best-effort because operating systems do not always allow a browser window to
+be forced to the foreground; the video window can continue playing separately.
 
 The token and OAuth client file are credentials: do not share or commit them.
 If access needs to be revoked, remove the app from your Google Account's

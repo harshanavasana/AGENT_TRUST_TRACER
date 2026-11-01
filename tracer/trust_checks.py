@@ -348,7 +348,10 @@ def _requested_sources(question: str) -> set[str]:
         )
     )
     youtube_requested = bool(
-        re.search(r"\b(youtube|video|videos|channel|channels)\b", normalized)
+        re.search(
+            r"\b(youtube|video|videos|channel|channels|play|song|music|watch)\b",
+            normalized,
+        )
     )
     if gmail_requested or youtube_requested:
         return {
@@ -368,7 +371,7 @@ def _scope_check(question: str, trace: RunTrace) -> TrustCheck:
     out_of_scope = [
         record
         for record in tools
-        if record.detail.get("source") not in {"gmail", "youtube"}
+        if record.detail.get("source") not in {"gmail", "youtube", "system"}
         or record.detail.get("source") not in requested_sources
     ]
     if out_of_scope:

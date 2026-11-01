@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
+import hashlib
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,8 +23,13 @@ from agent.gmail_agent import (
     resume_research_agent,
 )
 from agent.youtube_tools import build_youtube_service
+from agent.youtube_tools import set_youtube_open_mode
+from agent.voice_commands import parse_voice_command
+from voice.stt import SpeechToTextError, transcribe_with_confidence
+from voice.tts import speak
 from tracer.adaptive import AdaptiveStore
 from tracer.fusion import load_fusion_config
+from tracer.run_store import RunStore
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -33,6 +40,8 @@ _FRIENDLY_TOOL_NAMES = {
     "create_gmail_draft": "Create a Gmail draft",
     "send_gmail_message": "Send a Gmail message",
     "search_youtube": "Search YouTube",
+    "youtube_search_latest": "Find the latest YouTube video",
+    "open_youtube_video": "Open a YouTube video",
     "get_youtube_video_details": "Read YouTube video details",
     "get_youtube_channel_details": "Read YouTube channel details",
 }
@@ -78,7 +87,40 @@ def _jev_explanation(jev: object) -> str:
     return explanation
 
 
+def _browser_action(url: str, label: str) -> None:
+    """Open a trusted destination in a new tab without accepting arbitrary URLs."""
+    st.link_button(label, url, type="primary", width="content")
+
+
+def _voice_capture() -> bytes | None:
+    """Capture ephemeral audio with native Streamlit or an optional fallback."""
+    if hasattr(st, "audio_input"):
+        recording = st.audio_input("Record a voice command", key="voice_recording")
+    else:
+        try:
+            from streamlit_mic_recorder import mic_recorder
+        except ImportError:
+            st.error("This Streamlit version has no microphone input support.")
+            return None
+        recording = mic_recorder(
+            start_prompt="Start recording",
+            stop_prompt="Stop recording",
+            key="voice_recorder_fallback",
+        )
+    if recording is None:
+        return None
+    if hasattr(recording, "getvalue"):
+        return recording.getvalue()
+    if isinstance(recording, dict):
+        return recording.get("bytes")
+    return None
+
+
 st.set_page_config(page_title="Source Desk", page_icon="✳", layout="wide")
+incoming_voice_text = str(st.query_params.get("voice_command", "")).strip()
+incoming_voice_command = bool(incoming_voice_text)
+metrics_run_id = str(st.query_params.get("run", "")).strip()
+metrics_view = st.query_params.get("view") == "metrics"
 st.markdown(
     """
     <style>
@@ -196,16 +238,19 @@ if not token_file.is_absolute():
     token_file = PROJECT_ROOT / token_file
 
 if not os.environ.get("GROQ_API_KEY"):
-    st.error("Set GROQ_API_KEY in your local .env file before starting.")
-    st.stop()
+    if not incoming_voice_command and not metrics_view:
+        st.error("Set GROQ_API_KEY in your local .env file before starting.")
+        st.stop()
 if not os.environ.get("JEV_API_KEY"):
-    st.error("Set JEV_API_KEY in your local .env file before starting.")
-    st.stop()
+    if not incoming_voice_command and not metrics_view:
+        st.error("Set JEV_API_KEY in your local .env file before starting.")
+        st.stop()
 if not os.environ.get("YOUTUBE_API_KEY"):
-    st.error("Set YOUTUBE_API_KEY in your local .env file before starting.")
-    st.stop()
+    if not incoming_voice_command and not metrics_view:
+        st.error("Set YOUTUBE_API_KEY in your local .env file before starting.")
+        st.stop()
 client_file_exists = client_file.is_file()
-if source_mode != "YouTube" and not client_file_exists:
+if source_mode != "YouTube" and not client_file_exists and not metrics_view:
     st.error(
         "Set GOOGLE_OAUTH_CLIENT_FILE to the downloaded OAuth Desktop app "
         "client JSON file to search Gmail. Do not share or commit that file."
@@ -227,7 +272,7 @@ else:
     st.sidebar.caption("Gmail OAuth client is not configured.")
 
 service = st.session_state.get("gmail_service")
-if service is None and source_mode != "YouTube":
+if service is None and source_mode != "YouTube" and not incoming_voice_command and not metrics_view:
     st.info("Connect Gmail in the sidebar to search Gmail or both sources.")
     st.stop()
 st.sidebar.markdown("**Available sources**")
@@ -242,16 +287,108 @@ st.session_state.setdefault("research_run", None)
 st.session_state.setdefault("trust_report", None)
 st.session_state.setdefault("query_draft", "")
 st.session_state.setdefault("query_history", [])
+st.session_state.setdefault("browser_action", None)
+st.session_state.setdefault("tracer_stopped", None)
+st.session_state.setdefault("voice_auto_submit", False)
+st.session_state.setdefault("voice_auto_run", True)
+st.session_state.setdefault("voice_pending_auto_run", False)
 adaptive_db = os.environ.get(
     "AGENT_TRUST_DB",
     str(Path(__file__).parents[1] / ".agent-trust.sqlite"),
 )
 adaptive_store = AdaptiveStore(adaptive_db)
+run_store = RunStore(adaptive_db)
+
+
+def _render_durable_metrics(run_id: str) -> None:
+    record = run_store.get(run_id)
+    if record is None:
+        st.error("No durable metrics were found for that run ID.")
+        return
+    st.markdown("## Run metrics")
+    st.caption(f"Run `{run_id}` · {record.get('status', 'unknown')}")
+    st.write(
+        {
+            "transcript": record.get("transcript", ""),
+            "total_latency_ms": record.get("total_latency_ms"),
+            "spoken_reply": record.get("spoken_reply", ""),
+        }
+    )
+    st.markdown("### Action timeline")
+    st.dataframe(record.get("timeline", []), width="stretch", hide_index=True)
+    report = record.get("report", {})
+    checks = report.get("checks", []) if isinstance(report, dict) else []
+    if checks:
+        st.markdown("### Post-run checks")
+        st.dataframe(checks, width="stretch", hide_index=True)
+    if st.button("Replay command", key=f"replay-{run_id}"):
+        st.session_state["query_draft"] = record.get("transcript", "")
+        st.session_state["voice_pending_auto_run"] = False
+        st.query_params.clear()
+        st.rerun()
+
+
+if metrics_view and metrics_run_id:
+    _render_durable_metrics(metrics_run_id)
+    st.stop()
 
 def set_query(value: str) -> None:
     st.session_state["query_draft"] = value
 
 
+voice_command = str(st.query_params.get("voice_command", "")).strip()
+parsed_voice_command = None
+if voice_command:
+    st.query_params.clear()
+    parsed_voice_command = parse_voice_command(voice_command)
+    st.session_state["query_draft"] = parsed_voice_command.text
+    st.session_state["voice_auto_submit"] = True
+
+st.markdown("### Voice command")
+voice_cols = st.columns(3)
+with voice_cols[0]:
+    st.session_state["speak_replies"] = st.toggle(
+        "Speak replies", value=st.session_state.get("speak_replies", True)
+    )
+with voice_cols[1]:
+    st.session_state["voice_auto_run"] = st.toggle(
+        "Auto-run voice commands",
+        value=st.session_state.get("voice_auto_run", True),
+    )
+with voice_cols[2]:
+    player_mode = st.segmented_control(
+        "Open videos in",
+        ["browser", "in-app player"],
+        default=st.session_state.get("player_mode", "browser"),
+        key="player_mode",
+    )
+set_youtube_open_mode("in-app" if player_mode == "in-app player" else "browser")
+st.caption("Listening")
+voice_audio = _voice_capture()
+if voice_audio:
+    audio_key = hashlib.sha256(voice_audio).hexdigest()
+    if st.session_state.get("voice_audio_key") != audio_key:
+        st.session_state["voice_audio_key"] = audio_key
+        st.caption("Transcribing")
+        try:
+            transcript, confidence = transcribe_with_confidence(voice_audio)
+            st.session_state["query_draft"] = transcript
+            st.session_state["voice_transcript_ready"] = True
+            if (
+                st.session_state.get("voice_auto_run")
+                and len(st.session_state["query_draft"].split()) >= 2
+                and (confidence is None or confidence >= 0.35)
+            ):
+                st.session_state["voice_pending_auto_run"] = True
+            elif confidence is not None and confidence < 0.35:
+                st.warning(
+                    "Whisper confidence was low. Review the editable transcript "
+                    "and submit it manually."
+                )
+        except SpeechToTextError as error:
+            st.error(str(error))
+            st.session_state["voice_transcript_ready"] = False
+    st.info("Edit the transcript below, then submit it with the normal trusted pipeline.")
 prompt_cols = st.columns(3)
 quick_prompts = [
     "Find the most important email I received today.",
@@ -268,7 +405,7 @@ for column, prompt, key in zip(
         key=key,
         on_click=set_query,
         args=(prompt,),
-        use_container_width=True,
+        width="stretch",
     )
 
 history = st.session_state["query_history"]
@@ -294,19 +431,35 @@ with st.form("source_search", border=True):
     submit_search = st.form_submit_button(
         "Search sources",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
 
-if submit_search and not question.strip():
+voice_auto_submit = st.session_state.pop("voice_auto_submit", False)
+voice_auto_submit = voice_auto_submit or st.session_state.pop(
+    "voice_pending_auto_run", False
+)
+if (submit_search or voice_auto_submit) and not question.strip():
     st.warning("Enter a question before searching.")
-elif submit_search:
+elif submit_search or voice_auto_submit:
+    effective_source_mode = (
+        parsed_voice_command.source
+        if (
+            voice_auto_submit
+            and parsed_voice_command is not None
+            and parsed_voice_command.source
+        )
+        else source_mode
+    )
     scoped_question = {
         "Gmail": f"Use Gmail only. User request: {question}",
         "YouTube": f"Use YouTube only. User request: {question}",
-    }.get(source_mode, question)
+    }.get(effective_source_mode, question)
     try:
+        st.session_state["tracer_stopped"] = None
+        st.caption("Thinking")
         with st.spinner("Searching the connected sources..."):
             youtube_service = build_youtube_service()
+            st.caption("Acting")
             st.session_state["research_run"] = run_research_agent(
                 scoped_question,
                 service,
@@ -317,12 +470,20 @@ elif submit_search:
                         "read_gmail_message",
                         "create_gmail_draft",
                         "send_gmail_message",
+                        "open_site",
+                        "gmail_open_inbox",
+                        "return_to_dashboard",
                     ],
                     "YouTube": [
                         "search_youtube",
+                        "youtube_search_latest",
+                        "open_youtube_video",
                         "get_youtube_channel_details",
+                        "open_site",
+                        "youtube_search_and_play",
+                        "return_to_dashboard",
                     ],
-                }.get(source_mode),
+                }.get(effective_source_mode),
             )
             st.session_state["query_history"] = (
                 st.session_state["query_history"] + [question]
@@ -330,6 +491,7 @@ elif submit_search:
             st.session_state["trust_report"] = st.session_state[
                 "research_run"
             ].trust_report
+            st.caption("Done")
     except ResearchAgentError as error:
         st.error(str(error))
         st.session_state["research_run"] = None
@@ -340,7 +502,40 @@ elif submit_search:
         st.session_state["trust_report"] = None
 
 research_run = st.session_state.get("research_run")
-if research_run is not None and research_run.pending_approval:
+if research_run is not None:
+    if st.session_state.get("tracer_stopped"):
+        stopped = st.session_state["tracer_stopped"]
+        st.error(f"Tracer stopped: {stopped['reason']}")
+        _browser_action(
+            stopped["url"],
+            f"Open {stopped['destination'].capitalize()} where execution stopped",
+        )
+        st.caption(
+            "The run remains available below so you can inspect the exact "
+            "decision and reason that stopped it."
+        )
+    elif st.button("Stop tracer", type="secondary"):
+        last_action = browser_action or {}
+        destination = last_action.get("destination") or (
+            "gmail" if source_mode == "Gmail" else "youtube"
+        )
+        url = last_action.get("url") or (
+            "https://mail.google.com/"
+            if destination == "gmail"
+            else "https://www.youtube.com/"
+        )
+        st.session_state["tracer_stopped"] = {
+            "reason": (
+                "You stopped this run before the next agent action was "
+                "executed. No new source action was started."
+            ),
+            "destination": destination,
+            "url": url,
+        }
+        st.rerun()
+if research_run is not None and research_run.pending_approval and not st.session_state.get(
+    "tracer_stopped"
+):
     pending = research_run.pending_approval
     decision = pending.get("decision", {})
     st.warning(
@@ -392,6 +587,41 @@ if research_run is not None:
         st.markdown(research_run.answer)
     elif research_run.pending_approval:
         st.caption("The answer will be produced after the pending review decision.")
+    if research_run.answer and not research_run.pending_approval:
+        spoken_reply = re.sub(r"\s*\[E\d+\]", "", research_run.answer).strip()
+        spoken_reply = re.split(r"(?<=[.!?])\s+", spoken_reply, maxsplit=1)[0]
+        if st.session_state.get("speak_replies"):
+            reply_audio = speak(spoken_reply)
+            if reply_audio:
+                st.audio(reply_audio, format="audio/wav", autoplay=True)
+        if player_mode == "in-app player":
+            opened = [
+                record
+                for record in research_run.trust_report.primary_trace.records
+                if record.kind == "tool" and record.name in {
+                    "open_youtube_video",
+                    "youtube_search_and_play",
+                }
+                and record.status == "success"
+            ]
+            if opened:
+                video_id = opened[-1].detail.get("arguments", {}).get("video_id")
+                if not video_id:
+                    match = re.search(
+                        r"(?:Video ID:\s*|['\"]video_id['\"]:\s*['\"])([A-Za-z0-9_-]{11})",
+                        str(opened[-1].detail.get("result", "")),
+                    )
+                    video_id = match.group(1) if match else None
+                if video_id:
+                    st.video(
+                        f"https://www.youtube.com/watch?v={video_id}",
+                        format="video/mp4",
+                        subtitles=None,
+                    )
+        st.success(
+            "Run completed. The tracer returned to the dashboard and recorded "
+            "the normal metrics below."
+        )
 
 report = st.session_state.get("trust_report")
 if report is not None:

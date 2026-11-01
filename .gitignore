@@ -10,3 +10,4 @@ __pycache__/
 .agent-trust.sqlite-wal
 tracer/policy.yaml
 .streamlit/secrets.toml
+.browser_profile/
