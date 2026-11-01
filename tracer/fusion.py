@@ -19,7 +19,13 @@ DEFAULT_TOOL_RISKS = {
     "create_gmail_draft": "HIGH",
     "send_gmail_message": "HIGH",
     "search_youtube": "LOW",
+    "youtube_search_latest": "LOW",
+    "open_youtube_video": "MEDIUM",
     "get_youtube_channel_details": "LOW",
+    "open_site": "LOW",
+    "youtube_search_and_play": "MEDIUM",
+    "gmail_open_inbox": "LOW",
+    "return_to_dashboard": "LOW",
 }
 KNOWN_TOOLS = frozenset(DEFAULT_TOOL_RISKS)
 SOURCE_TOOLS = {
@@ -29,9 +35,20 @@ SOURCE_TOOLS = {
             "read_gmail_message",
             "create_gmail_draft",
             "send_gmail_message",
+            "gmail_open_inbox",
         }
     ),
-    "youtube": frozenset({"search_youtube", "get_youtube_channel_details"}),
+    "youtube": frozenset(
+        {
+            "search_youtube",
+            "youtube_search_latest",
+            "open_youtube_video",
+            "get_youtube_channel_details",
+            "open_site",
+            "youtube_search_and_play",
+        }
+    ),
+    "system": frozenset({"return_to_dashboard"}),
 }
 
 
@@ -65,6 +82,10 @@ class StepProposal:
 
     @property
     def source(self) -> str:
+        if self.tool_name == "open_site":
+            site = self.arguments.get("site")
+            if site in {"gmail", "youtube"}:
+                return site
         for source, tools in SOURCE_TOOLS.items():
             if self.tool_name in tools:
                 return source
@@ -199,7 +220,12 @@ def requested_sources(user_request: str) -> set[str]:
             text,
         )
     )
-    youtube = bool(re.search(r"\b(youtube|video|videos|channel|channels)\b", text))
+    youtube = bool(
+        re.search(
+            r"\b(youtube|video|videos|channel|channels|play|song|music|watch|latest\s+song)\b",
+            text,
+        )
+    )
     if gmail or youtube:
         return {
             source
@@ -222,24 +248,70 @@ def evaluate_layer_a(proposal: StepProposal) -> RuleResult:
             f"Tool {proposal.tool_name!r} is not allowed by the active tool policy.",
         )
     allowed_sources = requested_sources(proposal.user_request)
-    if proposal.source not in allowed_sources:
+    if proposal.source != "system" and proposal.source not in allowed_sources:
         return RuleResult(
             "FAIL", 1.0, True, "request_scope",
             f"The request does not authorize using the {proposal.source} source.",
         )
-    if proposal.tool_name in {"search_gmail", "search_youtube"}:
+    if proposal.tool_name in {"search_gmail", "search_youtube", "youtube_search_latest"}:
         query = proposal.arguments.get("query")
         if not isinstance(query, str) or not query.strip():
             return RuleResult(
                 "FAIL", 1.0, True, "query_required",
                 "Search calls must include a non-empty query.",
             )
-    if proposal.tool_name == "search_youtube":
+    if proposal.tool_name in {"search_youtube", "youtube_search_latest"}:
         query = str(proposal.arguments.get("query", ""))
         if len(query) > 200:
             return RuleResult(
                 "FAIL", 1.0, True, "query_length",
                 "YouTube search query exceeds the configured 200-character limit.",
+            )
+    if proposal.tool_name in {"open_site", "gmail_open_inbox"}:
+        site = proposal.arguments.get("site", "gmail")
+        if proposal.tool_name == "open_site" and site not in {"youtube", "gmail"}:
+            return RuleResult(
+                "FAIL", 1.0, True, "browser_site_allowlist",
+                "Browser navigation is limited to the fixed Gmail and YouTube sites.",
+            )
+    if proposal.tool_name == "youtube_search_and_play":
+        query = proposal.arguments.get("query")
+        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 200:
+            return RuleResult(
+                "FAIL", 1.0, True, "browser_query_length",
+                "Browser YouTube queries must contain 1-200 characters.",
+            )
+    if proposal.tool_name == "return_to_dashboard":
+        run_id = proposal.arguments.get("run_id")
+        if not isinstance(run_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{8,128}", run_id
+        ):
+            return RuleResult(
+                "FAIL", 1.0, True, "run_id_format",
+                "Dashboard return requires a valid run ID.",
+            )
+    if proposal.tool_name == "open_youtube_video":
+        video_id = proposal.arguments.get("video_id")
+        searched_ids = {
+            returned_id
+            for record in proposal.evidence
+            if record.get("tool") in {"search_youtube", "youtube_search_latest"}
+            for returned_id in re.findall(
+                r"(?m)^Video ID:\s*([A-Za-z0-9_-]{11})\s*$",
+                str(record.get("output", "")),
+            )
+        }
+        if not isinstance(video_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{11}", video_id
+        ):
+            return RuleResult(
+                "FAIL", 1.0, True, "youtube_video_id_format",
+                "YouTube video IDs must contain exactly 11 safe characters.",
+            )
+        if video_id not in searched_ids:
+            return RuleResult(
+                "FAIL", 1.0, True, "youtube_video_id_precondition",
+                "The video ID must come from a prior search in the same run.",
             )
     if proposal.tool_name == "read_gmail_message":
         message_id = proposal.arguments.get("message_id")

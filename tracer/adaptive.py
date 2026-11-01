@@ -17,7 +17,10 @@ from tracer.fusion import DEFAULT_TOOL_RISKS
 def classify_task(user_request: str) -> str:
     text = user_request.casefold()
     has_gmail = any(term in text for term in ("gmail", "email", "inbox"))
-    has_youtube = any(term in text for term in ("youtube", "video", "channel"))
+    has_youtube = any(
+        term in text
+        for term in ("youtube", "video", "channel", "play", "song", "music", "watch")
+    )
     if has_gmail and has_youtube:
         return "cross_source_research"
     if has_youtube:
@@ -48,9 +51,20 @@ def propose_tool_policy(
                 "read_gmail_message",
                 "create_gmail_draft",
                 "send_gmail_message",
+                "gmail_open_inbox",
             }
+            else "system"
+            if name == "return_to_dashboard"
             else "youtube"
-            if name in {"search_youtube", "get_youtube_channel_details"}
+            if name in {
+                "search_youtube",
+                "youtube_search_latest",
+                "open_youtube_video",
+                "get_youtube_channel_details",
+                "open_site",
+                "youtube_search_and_play",
+                "return_to_dashboard",
+            }
             else "unknown"
         )
         expected_effect = {
