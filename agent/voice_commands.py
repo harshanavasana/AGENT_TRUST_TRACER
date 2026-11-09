@@ -74,7 +74,10 @@ def parse_voice_command(text: str) -> VoiceCommand:
         "Gmail"
         if re.search(r"\b(gmail|email|emails|inbox|mail)\b", lowered)
         else "YouTube"
-        if re.search(r"\b(youtube|video|videos|channel)\b", lowered)
+        if re.search(
+            r"\b(youtube|video|videos|channel|song|music|play|watch|listen)\b",
+            lowered,
+        )
         else None
     )
     media_playback = any(
