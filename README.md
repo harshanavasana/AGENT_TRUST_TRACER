@@ -89,10 +89,27 @@ guidance.
 From the project directory, run:
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-python -m streamlit run dashboard/app.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+.\start-api.ps1
 ```
+
+The React/Vite dashboard is the primary interface. Start the frontend in a
+second terminal:
+
+```powershell
+.\start-frontend.ps1
+```
+
+Open `http://localhost:5173`. The React dashboard uses the same trust-traced
+agent functions and exposes the run timeline, review decisions, risk posture,
+live output, and voice-command entry point without Streamlit's rerun-based UI.
+The former Streamlit dashboard remains available for compatibility; install
+`requirements-legacy-streamlit.txt` before using it.
+
+On Windows, do not run `python -m uvicorn` from a system Python terminal unless
+that interpreter has the project dependencies installed. The launch script
+always uses `.venv\Scripts\python.exe`, avoiding `ModuleNotFoundError` errors.
 
 Choose **Connect Gmail** and accept the requested read and compose permissions.
 The authorized token is saved locally as `.gmail-token.json`. An existing

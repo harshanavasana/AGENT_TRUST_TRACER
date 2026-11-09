@@ -1,4 +1,6 @@
 .env
+frontend/node_modules/
+frontend/dist/
 .gmail-token.json
 token.json
 client_secret*.json
