@@ -143,7 +143,14 @@ def build_gmail_service(
             credentials = None
 
     if credentials and credentials.expired and credentials.refresh_token:
-        credentials.refresh(Request())
+        try:
+            credentials.refresh(Request())
+        except Exception as error:
+            from google.auth.exceptions import RefreshError
+
+            if not isinstance(error, RefreshError):
+                raise
+            credentials = None
     if not credentials or not credentials.valid:
         flow = InstalledAppFlow.from_client_secrets_file(
             str(client_path), GMAIL_SCOPES
@@ -323,6 +330,8 @@ def build_research_graph(
     fusion_config: FusionConfig | None = None,
     run_id: str = "",
     disable_write_tools: bool = False,
+    audit_only: bool = False,
+    audit_answer: str | None = None,
     run_store: RunStore | None = None,
 ) -> Any:
     """Build one LangGraph agent/tool loop over Gmail and public YouTube tools."""
@@ -343,6 +352,11 @@ def build_research_graph(
     ]
     if allowed_tools is not None:
         tools = [tool for tool in tools if tool.name in allowed_tools]
+    if any(tool.name == "youtube_search_and_play" for tool in tools):
+        # Controlled playback is the single browser owner. Keeping the legacy
+        # direct-open tool alongside it allows two browser launches for one
+        # request when the model emits multiple YouTube actions.
+        tools = [tool for tool in tools if tool.name != "open_youtube_video"]
     if disable_write_tools:
         tools = [
             tool
@@ -821,6 +835,9 @@ def build_research_graph(
             safe_error = type(error).__name__
             if status_code is not None:
                 safe_error += f" HTTP {status_code}"
+            detail = str(error).strip().replace("\n", " ")
+            if detail:
+                safe_error += f": {detail[:240]}"
             trace.add_tool_call(
                 tool_name,
                 source,
@@ -857,6 +874,8 @@ def build_research_graph(
         assistant_message = state["messages"][-1]
         if not assistant_message.tool_calls:
             return END
+        if audit_only:
+            return "audit_limit"
         if state.get("agent_turns", 0) >= MAX_AGENT_TURNS:
             return "limit_reached"
         return "tools"
@@ -873,10 +892,24 @@ def build_research_graph(
             ]
         }
 
+    def report_audit_limit(_: GmailAgentState) -> dict[str, Any]:
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        audit_answer
+                        or "Consistency pass completed without executing additional "
+                        "source or browser actions."
+                    )
+                )
+            ]
+        }
+
     graph = StateGraph(GmailAgentState)
     graph.add_node("agent", call_agent)
     graph.add_node("tools", execute_tools)
     graph.add_node("limit_reached", report_turn_limit)
+    graph.add_node("audit_limit", report_audit_limit)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
         "agent",
@@ -884,11 +917,13 @@ def build_research_graph(
         {
             "tools": "tools",
             "limit_reached": "limit_reached",
+            "audit_limit": "audit_limit",
             END: END,
         },
     )
     graph.add_edge("tools", "agent")
     graph.add_edge("limit_reached", END)
+    graph.add_edge("audit_limit", END)
     return graph.compile(checkpointer=MemorySaver())
 
 
@@ -935,22 +970,24 @@ def _initial_messages(
                             "Gmail tools may search and read messages, or create drafts "
                             "and send emails only after the user approves the exact "
                             "recipient and content in the UI. YouTube tools may "
-                    "only search public videos and read public video/channel "
-                    "details. There is no transcript tool. Be clear when "
+                    "search public videos and read public video/channel details. "
+                    "Do not open, play, or launch media for a search, summary, "
+                    "latest-video, channel, or research request. Only use "
+                    "youtube_search_and_play when the user explicitly asks to "
+                    "play, watch, listen to, or stream one video or audio item. "
+                    "Never call a browser or playback tool more than once for "
+                    "one user request. "
+                    "There is no transcript tool. Be clear when "
                     "a request is truly ambiguous by asking one short clarifying "
-                    "question. When finished, return a JSON object with exactly "
-                    "spoken_reply, actions_taken, and run_id fields; spoken_reply "
-                    "must be one short sentence. "
+                    "question. When finished, reply with one short plain-text "
+                    "sentence. Do not emit a JSON object or invent a tool named "
+                    "json. "
                     "search results are incomplete. Cite every factual sentence "
                     "using the evidence marker returned with the tool result, "
                     "for example [E1]. Do not invent evidence IDs. Request only "
-                    "one source tool call at a time."
-                    + (
-                        f" After completing the requested action, call "
-                        f"return_to_dashboard with run_id {run_id!r}."
-                        if run_id and not audit_only
-                        else ""
-                    )
+                    "one source tool call at a time. For explicit media playback, "
+                    "use only youtube_search_and_play; do not use "
+                    "open_youtube_video or open_site for media playback."
                     + (
                         (
                             " This is a consistency-only second pass. Do not "
@@ -1148,6 +1185,8 @@ def _run_pass(
             run_id=continuation.run_id,
             allowed_tools=continuation.allowed_tools,
             disable_write_tools=pass_number > 0,
+            audit_only=pass_number > 0,
+            audit_answer=continuation.primary_answer,
             run_store=continuation.run_store,
         )
         config = {
@@ -1303,7 +1342,10 @@ def run_research_agent(
             None,
             str(error),
         )
-        raise ResearchAgentError(str(error), report) from error
+        raise ResearchAgentError(
+            f"Agent action failed: {error}",
+            report,
+        ) from error
 
 
 def resume_research_agent(run: ResearchRun, approved: bool) -> ResearchRun:
@@ -1340,10 +1382,7 @@ def resume_research_agent(run: ResearchRun, approved: bool) -> ResearchRun:
             consistency_answer=completed_answer,
         )
     except (NotFoundError, APIStatusError, RuntimeError) as error:
-        message = (
-            f"Groq request failed ({type(error).__name__}). "
-            "Check the selected model, quota, and API configuration."
-        )
+        message = f"Agent action failed: {error}"
         report = build_trust_report(
             continuation.question,
             continuation.primary_answer or "",

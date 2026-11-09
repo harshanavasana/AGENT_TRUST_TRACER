@@ -93,27 +93,30 @@ def _browser_action(url: str, label: str) -> None:
 
 
 def _voice_capture() -> bytes | None:
-    """Capture ephemeral audio with native Streamlit or an optional fallback."""
-    if hasattr(st, "audio_input"):
-        recording = st.audio_input("Record a voice command", key="voice_recording")
-    else:
-        try:
-            from streamlit_mic_recorder import mic_recorder
-        except ImportError:
-            st.error("This Streamlit version has no microphone input support.")
-            return None
-        recording = mic_recorder(
-            start_prompt="Start recording",
-            stop_prompt="Stop recording",
-            key="voice_recorder_fallback",
+    """Capture audio and finish after five seconds of detected silence."""
+    try:
+        from audio_recorder_streamlit import audio_recorder
+    except ImportError:
+        st.error(
+            "Voice recording needs audio-recorder-streamlit. "
+            "Install the dependencies from requirements.txt."
         )
+        return None
+    recording = audio_recorder(
+        text="Start voice command",
+        energy_threshold=(0.01, 0.01),
+        pause_threshold=5.0,
+        sample_rate=16000,
+        key="voice_recorder",
+    )
     if recording is None:
         return None
-    if hasattr(recording, "getvalue"):
-        return recording.getvalue()
-    if isinstance(recording, dict):
-        return recording.get("bytes")
-    return None
+    return recording
+
+
+def _requests_media_playback(question: str) -> bool:
+    """Return whether the request explicitly asks to play or listen to media."""
+    return parse_voice_command(question).media_playback
 
 
 st.set_page_config(page_title="Source Desk", page_icon="✳", layout="wide")
@@ -292,6 +295,9 @@ st.session_state.setdefault("tracer_stopped", None)
 st.session_state.setdefault("voice_auto_submit", False)
 st.session_state.setdefault("voice_auto_run", True)
 st.session_state.setdefault("voice_pending_auto_run", False)
+st.session_state.setdefault("voice_command_intent", None)
+st.session_state.setdefault("speak_replies", True)
+st.session_state.setdefault("voice_run_active", False)
 adaptive_db = os.environ.get(
     "AGENT_TRUST_DB",
     str(Path(__file__).parents[1] / ".agent-trust.sqlite"),
@@ -342,6 +348,7 @@ if voice_command:
     st.query_params.clear()
     parsed_voice_command = parse_voice_command(voice_command)
     st.session_state["query_draft"] = parsed_voice_command.text
+    st.session_state["voice_command_intent"] = parsed_voice_command
     st.session_state["voice_auto_submit"] = True
 
 st.markdown("### Voice command")
@@ -373,6 +380,7 @@ if voice_audio:
         try:
             transcript, confidence = transcribe_with_confidence(voice_audio)
             st.session_state["query_draft"] = transcript
+            st.session_state["voice_command_intent"] = parse_voice_command(transcript)
             st.session_state["voice_transcript_ready"] = True
             if (
                 st.session_state.get("voice_auto_run")
@@ -382,7 +390,7 @@ if voice_audio:
                 st.session_state["voice_pending_auto_run"] = True
             elif confidence is not None and confidence < 0.35:
                 st.warning(
-                    "Whisper confidence was low. Review the editable transcript "
+                    "Speech recognition confidence was low. Review the editable transcript "
                     "and submit it manually."
                 )
         except SpeechToTextError as error:
@@ -438,70 +446,113 @@ voice_auto_submit = st.session_state.pop("voice_auto_submit", False)
 voice_auto_submit = voice_auto_submit or st.session_state.pop(
     "voice_pending_auto_run", False
 )
+voice_command_intent = st.session_state.pop("voice_command_intent", None)
+voice_intent_matches_question = (
+    voice_command_intent is not None
+    and voice_command_intent.text.casefold() == question.strip().casefold()
+)
 if (submit_search or voice_auto_submit) and not question.strip():
     st.warning("Enter a question before searching.")
 elif submit_search or voice_auto_submit:
-    effective_source_mode = (
-        parsed_voice_command.source
-        if (
-            voice_auto_submit
-            and parsed_voice_command is not None
-            and parsed_voice_command.source
+    if (
+        voice_intent_matches_question
+        and voice_command_intent.destination
+        and voice_command_intent.url
+        and not voice_command_intent.media_playback
+    ):
+        st.success(
+            f"I understood that as opening {voice_command_intent.destination.capitalize()}."
         )
-        else source_mode
-    )
-    scoped_question = {
-        "Gmail": f"Use Gmail only. User request: {question}",
-        "YouTube": f"Use YouTube only. User request: {question}",
-    }.get(effective_source_mode, question)
-    try:
-        st.session_state["tracer_stopped"] = None
-        st.caption("Thinking")
-        with st.spinner("Searching the connected sources..."):
-            youtube_service = build_youtube_service()
-            st.caption("Acting")
-            st.session_state["research_run"] = run_research_agent(
-                scoped_question,
-                service,
-                youtube_service,
-                allowed_tools={
-                    "Gmail": [
-                        "search_gmail",
-                        "read_gmail_message",
-                        "create_gmail_draft",
-                        "send_gmail_message",
-                        "open_site",
-                        "gmail_open_inbox",
-                        "return_to_dashboard",
-                    ],
-                    "YouTube": [
-                        "search_youtube",
-                        "youtube_search_latest",
-                        "open_youtube_video",
-                        "get_youtube_channel_details",
-                        "open_site",
-                        "youtube_search_and_play",
-                        "return_to_dashboard",
-                    ],
-                }.get(effective_source_mode),
+        _browser_action(
+            voice_command_intent.url,
+            f"Open {voice_command_intent.destination.capitalize()}",
+        )
+        st.session_state["voice_pending_auto_run"] = False
+    else:
+        effective_source_mode = (
+            voice_command_intent.source
+            if (
+                voice_intent_matches_question
+                and voice_command_intent.source
             )
-            st.session_state["query_history"] = (
-                st.session_state["query_history"] + [question]
-            )[-10:]
-            st.session_state["trust_report"] = st.session_state[
-                "research_run"
-            ].trust_report
-            st.caption("Done")
-    except ResearchAgentError as error:
-        st.error(str(error))
-        st.session_state["research_run"] = None
-        st.session_state["trust_report"] = error.trace_report
-    except RuntimeError as error:
-        st.error(str(error))
-        st.session_state["research_run"] = None
-        st.session_state["trust_report"] = None
+            else source_mode
+        )
+        scoped_question = {
+            "Gmail": f"Use Gmail only. User request: {question}",
+            "YouTube": f"Use YouTube only. User request: {question}",
+        }.get(effective_source_mode, question)
+        try:
+            st.session_state["voice_run_active"] = voice_auto_submit
+            st.session_state["tracer_stopped"] = None
+            st.caption("Thinking")
+            with st.spinner("Searching the connected sources..."):
+                youtube_service = build_youtube_service()
+                st.caption("Acting")
+                youtube_tools = [
+                    "search_youtube",
+                    "youtube_search_latest",
+                    "get_youtube_channel_details",
+                ]
+                if _requests_media_playback(question):
+                    youtube_tools.append("youtube_search_and_play")
+                st.session_state["research_run"] = run_research_agent(
+                    scoped_question,
+                    service,
+                    youtube_service,
+                    allowed_tools={
+                        "Gmail": [
+                            "search_gmail",
+                            "read_gmail_message",
+                            "create_gmail_draft",
+                            "send_gmail_message",
+                        ],
+                        "YouTube": [
+                            *youtube_tools,
+                        ],
+                    }.get(effective_source_mode),
+                )
+                st.session_state["query_history"] = (
+                    st.session_state["query_history"] + [question]
+                )[-10:]
+                st.session_state["trust_report"] = st.session_state[
+                    "research_run"
+                ].trust_report
+                st.caption("Done")
+        except ResearchAgentError as error:
+            st.error(str(error))
+            st.session_state["research_run"] = None
+            st.session_state["trust_report"] = error.trace_report
+        except RuntimeError as error:
+            st.error(str(error))
+            st.session_state["research_run"] = None
+            st.session_state["trust_report"] = None
 
 research_run = st.session_state.get("research_run")
+if research_run is not None and not research_run.pending_approval:
+    st.session_state["voice_run_active"] = False
+if (
+    research_run is not None
+    and research_run.pending_approval
+    and st.session_state.get("voice_run_active")
+    and research_run.pending_approval.get("tool")
+    not in {"create_gmail_draft", "send_gmail_message"}
+):
+    try:
+        with st.spinner("The trust model approved this non-write voice action..."):
+            resumed = resume_research_agent(research_run, approved=True)
+            st.session_state["research_run"] = resumed
+            st.session_state["trust_report"] = resumed.trust_report
+        st.rerun()
+    except ResearchAgentError as error:
+        st.error(f"Voice action failed: {error}")
+        st.session_state["research_run"] = None
+        st.session_state["trust_report"] = error.trace_report
+        st.session_state["voice_run_active"] = False
+    except (RuntimeError, ValueError) as error:
+        st.error(f"Voice action failed: {error}")
+        st.session_state["research_run"] = None
+        st.session_state["trust_report"] = None
+        st.session_state["voice_run_active"] = False
 if research_run is not None:
     if st.session_state.get("tracer_stopped"):
         stopped = st.session_state["tracer_stopped"]
