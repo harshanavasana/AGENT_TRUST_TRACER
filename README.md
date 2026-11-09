@@ -97,9 +97,9 @@ python -m streamlit run dashboard/app.py
 Choose **Connect Gmail** and accept the requested read and compose permissions.
 The authorized token is saved locally as `.gmail-token.json`. An existing
 read-only token cannot grant compose permission: the app detects this and
-starts consent again. If it does not, stop the app and delete only the local
-token file (or the file named by `GMAIL_TOKEN_FILE`), then reconnect. Do not
-delete the OAuth client JSON. Ask a question after Gmail is connected.
+starts consent again. If a saved token is expired or revoked, clicking
+**Connect / refresh Gmail** automatically starts consent again. Do not delete
+the OAuth client JSON. Ask a question after Gmail is connected.
 
 Draft and send tool calls pause for a UI decision. For a draft, approve the
 displayed exact recipient, subject, and body to create it in Gmail Drafts. For
@@ -114,23 +114,28 @@ recent searches. Selecting Gmail or YouTube binds only that source's tools to
 the agent for the run; **Both sources** leaves both available. Results include
 the trust report, run metrics, and expandable trace details.
 
-The dashboard also supports browser voice recognition in supported browsers.
-Select **Start voice command**, allow microphone access, and say a natural
-language request such as “open YouTube” or “find my project email”. The
-transcript is placed in the normal command box, so submitting it uses the same
-traced agent workflow as typed input. “Open YouTube” and “open Gmail” use
-fixed, safe destinations and provide an explicit **Open** button. While a run
-is active, **Stop tracer** records why execution was stopped, preserves the
-trace for review, and provides a link to the relevant destination. Completed
-runs return to the dashboard and display the existing metrics and trust checks.
-Speech recognition is supplied by the browser; Chrome or Edge over localhost
-is recommended.
+The dashboard also supports voice commands through Streamlit's microphone
+input. Select **Record a voice command**, allow microphone access, and say a
+natural-language request such as “open YouTube” or “find my project email”.
+The Parakeet transcript is placed in the normal command box, so submitting it
+uses the same traced agent workflow as typed input. Common navigation phrasing
+such as “pull up my inbox” and “bring me to You Tube” is recognized
+conservatively. “Open YouTube” and “open Gmail” use fixed, safe destinations
+and provide an explicit **Open** button. While a run is active, **Stop tracer**
+records why execution was stopped, preserves the trace for review, and
+provides a link to the relevant destination. Completed runs return to the
+dashboard and display the existing metrics and trust checks.
 
 ## Voice assistant
 
-The Voice panel records an ephemeral microphone clip, sends it to Groq Whisper
-(`whisper-large-v3-turbo`), and places the editable transcript in the same
-trusted command box used for typed requests. Replies can be spoken with Groq
+The Voice panel records an ephemeral microphone clip and sends it to Hugging
+Face hosted inference using OpenAI Whisper Large v3
+(`openai/whisper-large-v3` by default). It places the transcript in the
+same trusted command box used for typed requests. Set `HF_TOKEN` to a
+Hugging Face token with inference permission. Set `HF_ASR_MODEL` to another
+compatible checkpoint if needed. `HF_WHISPER_MODEL` remains accepted as a
+legacy setting.
+Replies can be spoken with Groq
 Orpheus (`canopylabs/orpheus-v1-english`), with `edge-tts`, `pyttsx3`, and
 text-only fallbacks. Optional settings are:
 
@@ -141,17 +146,31 @@ with its timeline, trust decisions, and post-run checks. The auto-run guard
 hashes each recording so Streamlit reruns do not execute it twice.
 
 ```dotenv
-GROQ_STT_MODEL=whisper-large-v3-turbo
+VOICE_STT_PROVIDER=huggingface
+HF_ASR_MODEL=openai/whisper-large-v3
+HF_INFERENCE_PROVIDER=hf-inference
+HF_TOKEN=your-huggingface-token
 GROQ_TTS_MODEL=canopylabs/orpheus-v1-english
 GROQ_TTS_VOICE=hannah
 # Optional: GROQ_STT_LANGUAGE=en
+# Optional fallback to Groq if hosted ASR fails:
+# VOICE_STT_FALLBACK_TO_GROQ=true
 ```
+
+Install dependencies with `python -m pip install -r requirements.txt`. Set
+`VOICE_STT_PROVIDER=groq` to use Groq instead, or set
+`VOICE_STT_PROVIDER=huggingface-local` only when local PyTorch ASR is
+available. If `VOICE_STT_FALLBACK_TO_GROQ=true`, a Hugging Face failure falls
+back to Groq. The agent still interprets the transcript with its
+natural-language model and executes actions through the existing trust gates;
+transcription does not directly execute commands.
 
 Example commands: “Get me the latest song of Taylor Swift”, “Check my latest
 emails”, and “Find videos about LangGraph tutorials”. Sending email always
 pauses for on-screen approval of the exact recipient, subject, and body;
-speaking “yes” cannot approve it. Voice audio and spoken-reply text are sent
-to Groq for processing. Raw audio is not stored by the application. Browser
+speaking “yes” cannot approve it. The transcript is sent to the Groq chat
+model for reasoning; raw audio is sent only to the selected speech-to-text
+provider and is not stored by the application. Browser
 opening happens on the machine running Streamlit; use the in-app player when
 hosting remotely. Microphone permissions, API quotas, unavailable results, and
 optional local TTS engines can prevent voice output without preventing the
@@ -165,6 +184,20 @@ send, purchase, delete, or confirmation controls. Set `DASHBOARD_URL` when the
 dashboard is not at `http://localhost:8501`. Returning to the metrics URL is
 best-effort because operating systems do not always allow a browser window to
 be forced to the foreground; the video window can continue playing separately.
+Browser actions run outside Streamlit's asyncio event loop. If headed Playwright cannot start on the host, the controlled browser action
+fails explicitly; it never falls back to a second system-browser window. Set
+`BROWSER_EXECUTABLE_PATH` when a specific installed browser executable should
+be used.
+
+Voice recording uses `audio-recorder-streamlit` voice activity detection. A
+recording automatically ends after five seconds below the configured energy
+threshold, then the transcript is sent through the normal auto-run pipeline.
+
+For video playback, the agent uses the YouTube Data API to select a video ID
+before opening its exact `watch?v=` URL. Requested title/channel terms must
+match the returned metadata. It does not scrape the YouTube results page or
+open a direct system-browser URL, because either fallback can select an
+unrelated promoted or personalized result.
 
 The token and OAuth client file are credentials: do not share or commit them.
 If access needs to be revoked, remove the app from your Google Account's

@@ -6,8 +6,8 @@ import os
 import re
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal
-from urllib.parse import quote
 
 from tracer.run_store import RunStore
 
@@ -19,15 +19,28 @@ VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 MAX_BROWSER_STEPS = 8
 DEFAULT_BROWSER_TIMEOUT_MS = 30_000
 _LIVE_CONTEXTS: dict[str, tuple[Any, Any, Any]] = {}
+_BROWSER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="source-desk-browser",
+)
+
+
+def _run_browser(operation: Any) -> Any:
+    """Run sync Playwright outside Streamlit's asyncio event-loop thread."""
+    return _BROWSER_EXECUTOR.submit(operation).result()
 
 
 def _context() -> Any:
     from playwright.sync_api import sync_playwright
 
     playwright = sync_playwright().start()
+    launch_options = {"headless": False}
+    executable_path = os.environ.get("BROWSER_EXECUTABLE_PATH")
+    if executable_path:
+        launch_options["executable_path"] = executable_path
     browser = playwright.chromium.launch_persistent_context(
         os.environ.get("BROWSER_PROFILE_DIR", ".browser_profile"),
-        headless=False,
+        **launch_options,
     )
     return playwright, browser, browser.pages[0] if browser.pages else browser.new_page()
 
@@ -35,35 +48,57 @@ def _context() -> Any:
 def _close(context: tuple[Any, Any, Any]) -> None:
     playwright, browser, _page = context
     try:
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
     finally:
-        playwright.stop()
+        try:
+            playwright.stop()
+        except Exception:
+            pass
 
 
 def _play_video(url: str, run_id: str = "") -> dict[str, Any]:
-    context = _context()
-    _playwright, browser, page = context
-    try:
-        page.set_default_timeout(DEFAULT_BROWSER_TIMEOUT_MS)
-        page.goto(url, wait_until="domcontentloaded")
-        for selector in ("button[aria-label*='Accept']", "button:has-text('Accept all')"):
-            try:
-                page.locator(selector).first.click(timeout=2000)
-                break
-            except Exception:
-                continue
+    def play() -> dict[str, Any]:
+        context = _context()
+        _playwright, _browser, page = context
         try:
-            page.locator(".ytp-play-button").click(timeout=5000)
+            page.set_default_timeout(DEFAULT_BROWSER_TIMEOUT_MS)
+            page.goto(url, wait_until="domcontentloaded")
+            for selector in (
+                "button[aria-label*='Accept']",
+                "button:has-text('Accept all')",
+            ):
+                try:
+                    page.locator(selector).first.click(timeout=2000)
+                    break
+                except Exception:
+                    continue
+            try:
+                page.locator(".ytp-play-button").click(timeout=5000)
+            except Exception:
+                pass
+            result = {"status": "playing", "url": page.url, "title": page.title()}
+            if run_id:
+                _LIVE_CONTEXTS[run_id] = context
+            else:
+                _close(context)
+            return result
         except Exception:
-            pass
-        if run_id:
-            _LIVE_CONTEXTS[run_id] = context
-        else:
             _close(context)
-        return {"status": "playing", "url": page.url, "title": page.title()}
-    except Exception:
-        _close(context)
-        raise
+            raise
+
+    try:
+        return _run_browser(play)
+    except Exception as error:
+        # Do not open a second browser after Playwright has already launched.
+        # The caller must retry explicitly if the controlled browser action fails.
+        raise RuntimeError(
+            "YouTube browser playback failed after the controlled browser "
+            f"operation started ({type(error).__name__}: {error}); "
+            "no second browser was opened."
+        ) from error
 
 
 def build_browser_tools(
@@ -78,6 +113,7 @@ def build_browser_tools(
 
     searched_video_ids: set[str] = set()
     steps = 0
+    playback_started = False
 
     def record(name: str, status: str, **detail: Any) -> None:
         if run_store and run_id:
@@ -98,19 +134,29 @@ def build_browser_tools(
         record("Opening site", "started", site=site)
         if not browser_enabled:
             return f"Browser action disabled in this consistency pass: {site}."
-        context = _context()
-        try:
-            context[2].set_default_timeout(DEFAULT_BROWSER_TIMEOUT_MS)
-            context[2].goto(ALLOWED_SITES[site], wait_until="domcontentloaded")
-            result = f"Opened {site}."
-            record("Opening site", "finished", site=site)
-            if run_id:
-                _LIVE_CONTEXTS[run_id] = context
+        def open_page() -> str:
+            context = _context()
+            try:
+                context[2].set_default_timeout(DEFAULT_BROWSER_TIMEOUT_MS)
+                context[2].goto(ALLOWED_SITES[site], wait_until="domcontentloaded")
+                result = f"Opened {site}."
+                record("Opening site", "finished", site=site)
+                if run_id:
+                    _LIVE_CONTEXTS[run_id] = context
+                    return result
                 return result
-            return result
-        finally:
-            if context not in _LIVE_CONTEXTS.values():
-                _close(context)
+            finally:
+                if context not in _LIVE_CONTEXTS.values():
+                    _close(context)
+
+        try:
+            return _run_browser(open_page)
+        except Exception as error:
+            record("Opening site", "failed", site=site, error=type(error).__name__)
+            raise RuntimeError(
+                f"Opening the controlled {site} browser destination failed; "
+                "no system-browser fallback was used."
+            ) from error
 
     @tool
     def youtube_search_and_play(
@@ -119,7 +165,13 @@ def build_browser_tools(
         official_only: bool = True,
     ) -> str:
         """Find and play a YouTube video using API metadata and bounded browser control."""
+        nonlocal playback_started
         step()
+        if playback_started:
+            raise RuntimeError(
+                "Only one YouTube playback action is allowed per run; "
+                "no additional browser tab was opened."
+            )
         if not query.strip() or len(query) > 200:
             raise ValueError("YouTube queries must be 1-200 characters.")
         record("Searching YouTube", "started", query_length=len(query))
@@ -135,37 +187,11 @@ def build_browser_tools(
                 )
                 .execute()
             )
-        except Exception:
-            if not browser_enabled:
-                raise
-            context = _context()
-            try:
-                page = context[2]
-                page.set_default_timeout(DEFAULT_BROWSER_TIMEOUT_MS)
-                page.goto(
-                    f"https://www.youtube.com/results?search_query={quote(query)}",
-                    wait_until="domcontentloaded",
-                )
-                link = page.locator("a#video-title").first
-                href = link.get_attribute("href") or ""
-                title = link.get_attribute("title") or "YouTube result"
-                match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", href)
-                if not match:
-                    raise RuntimeError("YouTube page search returned no video.")
-                video_id = match.group(1)
-                searched_video_ids.add(video_id)
-                _play_video(f"https://www.youtube.com/watch?v={video_id}", run_id)
-                return {
-                    "title": title,
-                    "channel": "",
-                    "video_id": video_id,
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                    "published_at": "",
-                    "status": "playing",
-                }
-            finally:
-                if context not in _LIVE_CONTEXTS.values():
-                    _close(context)
+        except Exception as error:
+            raise RuntimeError(
+                "YouTube API search failed; no browser-page fallback was used "
+                "because it can select an unrelated result."
+            ) from error
         items = response.get("items", [])
         rejected = re.compile(r"\b(cover|reaction|lyric|fan[\s-]?made)\b", re.I)
         candidates = [
@@ -173,7 +199,42 @@ def build_browser_tools(
             if not official_only
             or not rejected.search(str(item.get("snippet", {}).get("title", "")))
         ]
-        item = (candidates or items)[0] if (candidates or items) else None
+        search_terms = {
+            term.casefold()
+            for term in re.findall(r"[A-Za-z0-9]+", query)
+            if term.casefold()
+            not in {
+                "play",
+                "open",
+                "watch",
+                "show",
+                "launch",
+                "latest",
+                "newest",
+                "new",
+                "song",
+                "video",
+                "music",
+            }
+        }
+        ranked = []
+        for candidate in candidates or items:
+            snippet = candidate.get("snippet", {})
+            searchable = " ".join(
+                (
+                    str(snippet.get("title", "")),
+                    str(snippet.get("channelTitle", "")),
+                    str(snippet.get("description", "")),
+                )
+            ).casefold()
+            score = sum(term in searchable for term in search_terms)
+            ranked.append((score, candidate))
+        if search_terms and ranked and max(score for score, _ in ranked) == 0:
+            return "No YouTube result matched the requested title or channel."
+        item = max(
+            enumerate(ranked),
+            key=lambda entry: (entry[1][0], -entry[0]),
+        )[1][1] if ranked else None
         if item is None:
             return "No YouTube results were found."
         video_id = item.get("id", {}).get("videoId")
@@ -181,6 +242,7 @@ def build_browser_tools(
         if not isinstance(video_id, str) or not VIDEO_ID_PATTERN.fullmatch(video_id):
             raise ValueError("YouTube returned an invalid video ID.")
         searched_video_ids.add(video_id)
+        playback_started = True
         url = f"https://www.youtube.com/watch?v={video_id}"
         record("Searching YouTube", "finished", video_id=video_id)
         if browser_enabled:
@@ -203,16 +265,30 @@ def build_browser_tools(
         step()
         if not browser_enabled:
             return "Browser action disabled in this consistency pass."
-        context = _context()
-        try:
-            context[2].goto(ALLOWED_SITES["gmail"], wait_until="domcontentloaded")
-            if run_id:
-                _LIVE_CONTEXTS[run_id] = context
+        def open_inbox() -> str:
+            context = _context()
+            try:
+                context[2].goto(ALLOWED_SITES["gmail"], wait_until="domcontentloaded")
+                if run_id:
+                    _LIVE_CONTEXTS[run_id] = context
+                    return "Opened Gmail inbox."
                 return "Opened Gmail inbox."
-            return "Opened Gmail inbox."
-        finally:
-            if context not in _LIVE_CONTEXTS.values():
-                _close(context)
+            finally:
+                if context not in _LIVE_CONTEXTS.values():
+                    _close(context)
+
+        try:
+            return _run_browser(open_inbox)
+        except Exception as error:
+            record(
+                "Opening Gmail inbox",
+                "failed",
+                error=type(error).__name__,
+            )
+            raise RuntimeError(
+                "Opening the controlled Gmail browser destination failed; "
+                "no system-browser fallback was used."
+            ) from error
 
     @tool
     def return_to_dashboard(run_id: str) -> str:
@@ -222,7 +298,6 @@ def build_browser_tools(
             raise ValueError("Invalid run ID.")
         dashboard_url = os.environ.get("DASHBOARD_URL", "http://localhost:8501")
         url = f"{dashboard_url}/?run={run_id}&view=metrics"
-        webbrowser.open(url)
-        return f"Returned to dashboard metrics for run {run_id}."
+        return f"Dashboard metrics are available for run {run_id}."
 
     return [open_site, youtube_search_and_play, gmail_open_inbox, return_to_dashboard]

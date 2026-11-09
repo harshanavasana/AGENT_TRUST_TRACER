@@ -35,6 +35,19 @@ def test_natural_language_navigation_is_recognized() -> None:
     assert command.destination == "gmail"
 
 
+def test_spoken_navigation_aliases_are_recognized() -> None:
+    command = parse_voice_command("Please pull up my inbox")
+
+    assert command.destination == "gmail"
+    assert command.url == "https://mail.google.com/"
+
+
+def test_youtube_alias_with_spaces_is_recognized() -> None:
+    command = parse_voice_command("Could you bring me to You Tube?")
+
+    assert command.destination == "youtube"
+
+
 def test_voice_command_infers_youtube_source_for_research() -> None:
     command = parse_voice_command("Find the latest video about robotics")
 
@@ -45,3 +58,11 @@ def test_voice_command_infers_gmail_source_for_research() -> None:
     command = parse_voice_command("Find my unread project emails")
 
     assert command.source == "Gmail"
+
+
+def test_voice_command_only_marks_explicit_media_requests_for_playback() -> None:
+    assert (
+        parse_voice_command("Find the latest video about robotics").media_playback
+        is False
+    )
+    assert parse_voice_command("Play the latest robotics video").media_playback is True

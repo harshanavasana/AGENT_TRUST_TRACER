@@ -293,14 +293,14 @@ def test_langgraph_runs_agent_tool_agent_flow(tmp_path) -> None:
     )
 
     assert answer.answer == "The project is on track. [E1]"
-    assert service.message_api.searches == 2
+    assert service.message_api.searches == 1
     assert len(answer.trust_report.checks) == 6
     assert answer.trust_report.checks[-1].status == "pass"
     assert len(answer.trust_report.primary_trace.records) == 8
-    assert len(answer.trust_report.consistency_trace.records) == 8
+    assert len(answer.trust_report.consistency_trace.records) == 2
 
 
-def test_jev_assesses_each_proposed_action_in_both_passes(
+def test_jev_assesses_proposed_actions_only_in_execution_pass(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -338,9 +338,9 @@ def test_jev_assesses_each_proposed_action_in_both_passes(
         for record in trace.records
         if record.kind == "layer" and record.name == "B1:Jev"
     ]
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert all(call[0] == "test-key" and call[2] == "jev-test" for call in calls)
-    assert len(jev_records) == 2
+    assert len(jev_records) == 1
     assert all(record.status == "PASS" for record in jev_records)
     assert all(
         "B1:Jev" in record.detail["layers"]
@@ -415,8 +415,23 @@ def test_langgraph_returns_notice_at_agent_turn_limit(tmp_path) -> None:
     )
 
     assert "step limit" in answer.answer
-    assert model.calls == MAX_AGENT_TURNS * 2
-    assert service.message_api.searches == (MAX_AGENT_TURNS - 1) * 2
+    assert model.calls == MAX_AGENT_TURNS + 1
+    assert service.message_api.searches == MAX_AGENT_TURNS - 1
+
+
+def test_consistency_pass_does_not_execute_source_tools(tmp_path) -> None:
+    model = _AlwaysSearchModel()
+    service = _GmailService()
+    result = run_research_agent(
+        "Keep searching",
+        service,
+        _YouTubeService(),
+        model=model,
+        adaptive_store=AdaptiveStore(tmp_path / "adaptive.sqlite"),
+    )
+
+    assert "step limit" in result.answer
+    assert service.message_api.searches == MAX_AGENT_TURNS - 1
 
 
 class _UnknownJudge:
@@ -481,10 +496,6 @@ def test_unknown_high_risk_action_pauses_until_human_decision(tmp_path) -> None:
     assert result.pending_approval["tool"] == "search_gmail"
     assert service.message_api.searches == 0
     result = resume_research_agent(result, approved=False)
-    assert result.pending_approval["tool"] == "search_gmail"
-    assert service.message_api.searches == 0
-    result = resume_research_agent(result, approved=False)
-
     assert result.pending_approval is None
     assert "rejected read" in result.answer
     assert service.message_api.searches == 0
@@ -511,10 +522,6 @@ def test_approved_high_risk_review_executes_only_after_resume(tmp_path) -> None:
     assert service.message_api.searches == 0
     result = resume_research_agent(result, approved=True)
     assert service.message_api.searches == 1
-    assert result.pending_approval["tool"] == "search_gmail"
-    result = resume_research_agent(result, approved=True)
-
-    assert service.message_api.searches == 2
     assert result.pending_approval is None
     assert result.answer == "The search completed."
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 from typing import Any
-import webbrowser
 from contextvars import ContextVar
 
 MAX_YOUTUBE_RESULTS = 5
@@ -178,18 +177,17 @@ def build_youtube_tools(
 
     @tool
     def open_youtube_video(video_id: str) -> str:
-        """Open a video ID returned by a YouTube search in the active player."""
+        """Validate a searched video ID without opening a second browser."""
         if not isinstance(video_id, str) or not YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id):
             raise ValueError("YouTube video ID must be exactly 11 safe characters.")
         if video_id not in searched_video_ids:
             raise ValueError(
                 "The video ID must come from a prior YouTube search in the same run."
             )
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        if _OPEN_MODE.get() == "browser":
-            webbrowser.open(url)
-            return f"Opened YouTube video {video_id} in the browser."
-        return f"Ready to play YouTube video {video_id} in the in-app player."
+        return (
+            f"Video {video_id} is validated. Use the controlled "
+            "youtube_search_and_play action to open it."
+        )
 
     @tool
     def get_youtube_channel_details(channel_id: str) -> str:
