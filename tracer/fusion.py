@@ -592,6 +592,11 @@ def requires_human_review(
     """Escalate only consequential writes or review signals above configured limits."""
     if decision.verdict != "REVIEW":
         return False
+    if tool_name == "youtube_search_and_play":
+        # Explicit playback is a bounded, user-requested browser action. It
+        # remains subject to deterministic policy failures, but trust
+        # uncertainty must not turn a direct voice command into a prompt.
+        return False
     if any(reason.startswith("Jev") for reason in decision.reasons):
         return True
     if tool_name in {"create_gmail_draft", "send_gmail_message"}:

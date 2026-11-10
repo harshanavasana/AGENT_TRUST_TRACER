@@ -24,6 +24,8 @@ from agent.gmail_agent import (
     extract_message_body,
     run_research_agent,
     resume_research_agent,
+    _groq_retry_after,
+    _groq_status_code,
 )
 from agent.youtube_tools import (
     MAX_YOUTUBE_QUERY_CHARS,
@@ -34,6 +36,19 @@ from agent.youtube_tools import (
 
 def test_default_groq_model_supports_tool_calls() -> None:
     assert DEFAULT_GROQ_MODEL == "openai/gpt-oss-120b"
+
+
+def test_groq_rate_limit_error_reads_status_and_retry_hint() -> None:
+    class RateLimitError(Exception):
+        status_code = 429
+
+        def __str__(self):
+            return "Rate limit reached. Please try again in 14.04s."
+
+    error = RateLimitError()
+
+    assert _groq_status_code(error) == 429
+    assert _groq_retry_after(error) == 14.04
 
 
 def test_groq_request_context_is_bounded() -> None:

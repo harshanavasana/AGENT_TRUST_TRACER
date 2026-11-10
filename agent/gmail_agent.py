@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -12,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from time import perf_counter
 from typing import Annotated, Any, TypedDict
 from uuid import uuid4
@@ -56,6 +59,8 @@ MAX_MESSAGE_CHARS = 3_000
 MAX_TOTAL_READ_CHARS = 5_000
 MAX_AGENT_TURNS = 6
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_GROQ_RATE_LIMIT_RETRIES = 1
+DEFAULT_GROQ_RATE_LIMIT_MAX_WAIT_SECONDS = 30.0
 
 
 class GmailAgentState(TypedDict, total=False):
@@ -72,6 +77,40 @@ class ResearchAgentError(RuntimeError):
         self.trace_report = trace_report
 
 
+class GmailToolResult(str):
+    """Backward-compatible text result carrying structured Gmail evidence."""
+
+    payload: dict[str, Any]
+
+    def __new__(cls, text: str, payload: dict[str, Any]) -> "GmailToolResult":
+        value = str.__new__(cls, text)
+        value.payload = payload
+        return value
+
+
+def _gmail_error(error: Exception, operation: str) -> RuntimeError:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "resp", None)
+        status = getattr(response, "status", None)
+    if status == 401:
+        return RuntimeError(
+            f"Gmail {operation} failed because authorization expired. Reconnect Gmail."
+        )
+    if status == 403:
+        return RuntimeError(
+            f"Gmail {operation} failed because the granted OAuth scope is insufficient. "
+            "Reconnect Gmail with the required permissions."
+        )
+    if status == 429:
+        return RuntimeError(
+            f"Gmail {operation} was rate limited. Retry after a short delay."
+        )
+    if status == 400:
+        return RuntimeError(f"Gmail rejected the {operation} request as invalid.")
+    return RuntimeError(f"Gmail {operation} failed: {type(error).__name__}.")
+
+
 class _HTMLTextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -81,6 +120,27 @@ class _HTMLTextParser(HTMLParser):
         text = data.strip()
         if text:
             self.parts.append(text)
+
+
+def _groq_status_code(error: Exception) -> int | None:
+    status_code = getattr(error, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _groq_retry_after(error: Exception) -> float:
+    """Read a provider retry hint while keeping waits bounded."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    value = headers.get("retry-after") or headers.get("Retry-After")
+    if value:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", str(error), re.I)
+    if match:
+        return float(match.group(1))
+    return 5.0
 
 
 def _decode_part(payload: Mapping[str, Any]) -> str:
@@ -168,6 +228,7 @@ def build_gmail_tools(service: Any) -> list[Any]:
 
     searched_message_ids: set[str] = set()
     remaining_read_chars = MAX_TOTAL_READ_CHARS
+    sent_idempotency: dict[str, dict[str, Any]] = {}
 
     @tool
     def search_gmail(query: str) -> str:
@@ -207,7 +268,17 @@ def build_gmail_tools(service: Any) -> list[Any]:
                 f"Subject: {headers.get('subject', '(no subject)')}\n"
                 f"Snippet: {message.get('snippet', '')[:MAX_SNIPPET_CHARS]}"
             )
-        return "\n\n".join(results)
+        return GmailToolResult(
+            "\n\n".join(results),
+            {
+                "action": "gmail_search",
+                "count": len(results),
+                "messages": [
+                    {"messageId": item.split("\n", 1)[0].removeprefix("ID: ")}
+                    for item in results
+                ],
+            },
+        )
 
     @tool
     def read_gmail_message(message_id: str) -> str:
@@ -236,11 +307,20 @@ def build_gmail_tools(service: Any) -> list[Any]:
         remaining_read_chars -= len(body)
         if truncated:
             body += "\n[Email text truncated to stay within the Groq request limit.]"
-        return (
+        return GmailToolResult(
+            (
             f"From: {headers.get('from', '(unknown)')}\n"
             f"Date: {headers.get('date', '(unknown)')}\n"
             f"Subject: {headers.get('subject', '(no subject)')}\n\n"
             f"{body}"
+            ),
+            {
+                "action": "gmail_read",
+                "messageId": message_id,
+                "threadId": message.get("threadId"),
+                "labelIds": message.get("labelIds", []),
+                "snippet": message.get("snippet", "")[:MAX_SNIPPET_CHARS],
+            },
         )
 
     def build_mime_message(to: str, subject: str, body: str) -> EmailMessage:
@@ -262,12 +342,18 @@ def build_gmail_tools(service: Any) -> list[Any]:
 
     def encoded_message(to: str, subject: str, body: str) -> str:
         message = build_mime_message(to, subject, body)
+        return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+
+    def encoded_draft_message(to: str, subject: str, body: str) -> str:
+        # Gmail accepts both forms; retain padding for compatibility with
+        # older draft connectors while sends use the canonical unpadded form.
+        message = build_mime_message(to, subject, body)
         return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
 
     @tool
     def create_gmail_draft(to: str, subject: str, body: str) -> str:
         """Create a Gmail draft for one recipient; this does not send the email."""
-        raw_message = encoded_message(to, subject, body)
+        raw_message = encoded_draft_message(to, subject, body)
         response = (
             service.users()
             .drafts()
@@ -280,11 +366,31 @@ def build_gmail_tools(service: Any) -> list[Any]:
         draft_id = response.get("id")
         if not draft_id:
             raise RuntimeError("Gmail accepted the draft request without returning a draft ID.")
-        return f"Draft created (draft ID: {draft_id}). It has not been sent."
+        return GmailToolResult(
+            f"Draft created (draft ID: {draft_id}). It has not been sent.",
+            {
+                "action": "gmail_create_draft",
+                "draftId": draft_id,
+                "messageId": response.get("message", {}).get("id"),
+                "threadId": response.get("message", {}).get("threadId"),
+            },
+        )
 
     @tool
     def send_gmail_message(to: str, subject: str, body: str) -> str:
         """Send an email to one recipient; the trust gate requires UI approval first."""
+        idempotency_key = hashlib.sha256(
+            json.dumps(
+                {"to": to.strip().casefold(), "subject": subject.strip(), "body": body},
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if idempotency_key in sent_idempotency:
+            previous = sent_idempotency[idempotency_key]
+            return GmailToolResult(
+                f"Email already sent (message ID: {previous['messageId']}).",
+                {**previous, "duplicate": True},
+            )
         raw_message = encoded_message(to, subject, body)
         response = (
             service.users()
@@ -298,7 +404,31 @@ def build_gmail_tools(service: Any) -> list[Any]:
         message_id = response.get("id")
         if not message_id:
             raise RuntimeError("Gmail accepted the send request without returning a message ID.")
-        return f"Email sent (message ID: {message_id})."
+        verified = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="metadata")
+            .execute()
+        )
+        labels = verified.get("labelIds")
+        if labels is not None and "SENT" not in labels:
+            raise RuntimeError(
+                f"Gmail returned message ID {message_id}, but post-send verification "
+                "did not find the SENT label."
+            )
+        payload = {
+            "action": "gmail_send",
+            "messageId": message_id,
+            "threadId": response.get("threadId") or verified.get("threadId"),
+            "labelIds": labels or verified.get("labelIds", []),
+            "verified": True,
+            "idempotencyKey": idempotency_key,
+        }
+        sent_idempotency[idempotency_key] = payload
+        return GmailToolResult(
+            f"Email sent and verified (message ID: {message_id}).",
+            payload,
+        )
 
     return [
         search_gmail,
@@ -347,7 +477,10 @@ def build_research_graph(
             youtube_service,
             run_id=run_id,
             run_store=run_store,
-            browser_enabled=not disable_write_tools,
+            browser_enabled=(
+                not disable_write_tools
+                and os.environ.get("AGENT_PLAYBACK_MODE", "browser") != "in-app"
+            ),
         ),
     ]
     if allowed_tools is not None:
@@ -410,17 +543,52 @@ def build_research_graph(
 
     def call_agent(state: GmailAgentState) -> dict[str, Any]:
         started = perf_counter()
-        try:
-            response = agent.invoke(state["messages"])
-        except Exception as error:
-            trace.add(
-                "model",
-                f"Model turn {state.get('agent_turns', 0) + 1}",
-                "error",
-                (perf_counter() - started) * 1000,
-                error=type(error).__name__,
-            )
-            raise
+        max_retries = max(
+            0,
+            int(
+                os.environ.get(
+                    "GROQ_RATE_LIMIT_RETRIES",
+                    str(DEFAULT_GROQ_RATE_LIMIT_RETRIES),
+                )
+            ),
+        )
+        max_wait = max(
+            0.0,
+            float(
+                os.environ.get(
+                    "GROQ_RATE_LIMIT_MAX_WAIT_SECONDS",
+                    str(DEFAULT_GROQ_RATE_LIMIT_MAX_WAIT_SECONDS),
+                )
+            ),
+        )
+        attempt = 0
+        while True:
+            try:
+                response = agent.invoke(state["messages"])
+                break
+            except Exception as error:
+                if _groq_status_code(error) == 429 and attempt < max_retries:
+                    wait_seconds = min(max_wait, _groq_retry_after(error))
+                    trace.add(
+                        "model",
+                        f"Model turn {state.get('agent_turns', 0) + 1}",
+                        "rate_limited",
+                        (perf_counter() - started) * 1000,
+                        error="429",
+                        retry_in_seconds=wait_seconds,
+                        retry_number=attempt + 1,
+                    )
+                    time.sleep(wait_seconds)
+                    attempt += 1
+                    continue
+                trace.add(
+                    "model",
+                    f"Model turn {state.get('agent_turns', 0) + 1}",
+                    "error",
+                    (perf_counter() - started) * 1000,
+                    error=type(error).__name__,
+                )
+                raise
         tool_names = [
             str(call.get("name", "unknown"))
             for call in getattr(response, "tool_calls", [])
@@ -829,7 +997,8 @@ def build_research_graph(
 
         started = perf_counter()
         try:
-            result = str(tool.invoke(arguments))
+            raw_result = tool.invoke(arguments)
+            result = str(raw_result)
         except Exception as error:
             status_code = getattr(error, "status_code", None)
             safe_error = type(error).__name__
@@ -851,6 +1020,7 @@ def build_research_graph(
                 "Check the relevant API connection and permissions."
             ) from error
         evidence_id = trace.new_evidence_id()
+        structured_result = getattr(raw_result, "payload", None)
         trace.add_tool_call(
             tool_name,
             source,
@@ -860,6 +1030,8 @@ def build_research_graph(
             result=result,
             evidence_id=evidence_id,
         )
+        if structured_result:
+            trace.records[-1].detail["structured_result"] = structured_result
         if run_store and run_id:
             run_store.event(run_id, tool_name, "finished", outcome="success")
         tool_messages.append(
@@ -1327,7 +1499,13 @@ def run_research_agent(
             "tokens-per-minute limit. Try a narrower search/question or wait "
             "briefly and retry."
             if error.status_code == 413
-            else f"Groq request failed (HTTP {error.status_code})."
+            else (
+                "Groq is temporarily rate-limited for this model's tokens-per-minute "
+                "quota. Wait for the retry window or set GROQ_MODEL to an available "
+                "lower-throughput model."
+                if error.status_code == 429
+                else f"Groq request failed (HTTP {error.status_code})."
+            )
         )
         failed_trace = session.traces[0] if session.traces else RunTrace()
         report = build_trust_report(question, "", failed_trace, None, None, message)

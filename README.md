@@ -143,6 +143,22 @@ records why execution was stopped, preserves the trace for review, and
 provides a link to the relevant destination. Completed runs return to the
 dashboard and display the existing metrics and trust checks.
 
+## Policy and decision proof
+
+The React dashboard uses the same trust gate as the agent. Read-only public
+search and explicit YouTube playback are bounded, reversible actions and do
+not require human approval. Gmail draft/send operations still require
+approval of the exact content, while deterministic policy failures are
+blocked and cannot be overridden.
+
+Each run exposes the policy layers, decision, confidence, anomaly score,
+reasons, evidence IDs, and trust checks in the **Decision proof** panel. API
+playback returns a `PLAY_MEDIA` action to the embedded YouTube player. The
+player reports `PLAYING`, `PAUSED`, `ENDED`, or `ERROR` to
+`POST /api/media/status`; the backend records that event in the durable run
+timeline. Trust posture and resolution metrics are calculated from persisted
+run reports rather than static dashboard values.
+
 ## Voice assistant
 
 The Voice panel records an ephemeral microphone clip and sends it to Hugging

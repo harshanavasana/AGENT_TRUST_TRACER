@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import ast
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -31,6 +33,7 @@ async def lifespan(_app: FastAPI):
     from dotenv import load_dotenv
 
     load_dotenv(PROJECT_ROOT / ".env")
+    os.environ.setdefault("AGENT_PLAYBACK_MODE", "in-app")
     yield
 
 
@@ -59,9 +62,37 @@ class ApprovalRequest(BaseModel):
     approved: bool
 
 
+class MediaStatusRequest(BaseModel):
+    run_id: str = Field(min_length=8, max_length=128)
+    status: str = Field(pattern="^(PLAYING|PAUSED|ENDED|ERROR)$")
+    error_code: int | None = None
+
+
 class TranscriptionResponse(BaseModel):
     text: str
     confidence: float | None = None
+
+
+@app.get("/api/gmail/status")
+def gmail_status() -> dict[str, Any]:
+    token_file = Path(
+        os.environ.get("GMAIL_TOKEN_FILE", str(PROJECT_ROOT / ".gmail-token.json"))
+    ).expanduser()
+    if not token_file.is_file():
+        return {"connected": False, "reason": "Connect Gmail to authorize access."}
+    try:
+        from google.oauth2.credentials import Credentials
+
+        credentials = Credentials.from_authorized_user_file(str(token_file))
+    except (OSError, ValueError, TypeError) as error:
+        return {"connected": False, "reason": f"Saved Gmail authorization is invalid: {type(error).__name__}."}
+    scopes = sorted(credentials.scopes or [])
+    return {
+        "connected": bool(credentials.valid or credentials.refresh_token),
+        "expired": bool(credentials.expired),
+        "scopes": scopes,
+        "reconnect_required": not credentials.valid and not credentials.refresh_token,
+    }
 
 
 def _services(source: str) -> tuple[Any, Any]:
@@ -105,6 +136,23 @@ def _allowed_tools(source: str, question: str = "") -> list[str] | None:
 
 def _run_payload(run: Any) -> dict[str, Any]:
     report = run.trust_report.as_dict() if run.trust_report else {}
+    media_action = None
+    for record in report.get("primary_trace", {}).get("records", []):
+        if record.get("name") != "youtube_search_and_play" or record.get("status") != "success":
+            continue
+        try:
+            result = ast.literal_eval(str(record.get("detail", {}).get("result", "")))
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(result, dict) and result.get("video_id"):
+            media_action = {
+                "type": "PLAY_MEDIA",
+                "video_id": result["video_id"],
+                "title": result.get("title", "(untitled)"),
+                "url": result.get("url"),
+                "status": result.get("status", "ready_for_in_app_player"),
+            }
+            break
     return {
         "run_id": run.run_id,
         "status": "review" if run.pending_approval else "completed",
@@ -112,6 +160,7 @@ def _run_payload(run: Any) -> dict[str, Any]:
         "pending_approval": run.pending_approval,
         "task_type": run.task_type,
         "trust_report": report,
+        "media_action": media_action,
     }
 
 
@@ -125,13 +174,90 @@ def overview() -> dict[str, Any]:
     store = RunStore(
         os.environ.get("AGENT_TRUST_DB", str(PROJECT_ROOT / ".agent-trust.sqlite"))
     )
+    persisted_runs = store.list_recent()
+    current_runs = list(_runs.values())
+    completed_runs = [
+        run
+        for run in persisted_runs
+        if run.get("status") == "completed"
+    ]
+    check_results = [
+        check
+        for run in persisted_runs
+        for check in run.get("report", {}).get("checks", [])
+    ]
+    passed_checks = sum(check.get("status") == "pass" for check in check_results)
+    posture_score = (
+        round(100 * passed_checks / len(check_results))
+        if check_results
+        else None
+    )
     return {
-        "active_agents": 1,
-        "new_critical_alerts": 0,
-        "posture_score": 95,
-        "resolution_rate": 100,
-        "latest_run": store.get(next(iter(_runs), "")) if _runs else None,
+        "active_agents": 1 if any(run.pending_approval for run in current_runs) else 0,
+        "new_critical_alerts": sum(
+            check.get("status") in {"warning", "fail"} for check in check_results
+        ),
+        "posture_score": posture_score,
+        "resolution_rate": (
+            round(100 * len(completed_runs) / len(persisted_runs))
+            if persisted_runs
+            else None
+        ),
+        "latest_run": persisted_runs[0] if persisted_runs else None,
     }
+
+
+@app.get("/api/traces")
+def traces() -> list[dict[str, Any]]:
+    store = RunStore(
+        os.environ.get("AGENT_TRUST_DB", str(PROJECT_ROOT / ".agent-trust.sqlite"))
+    )
+    return store.list_recent()
+
+
+@app.get("/api/metrics/trust")
+def trust_metrics() -> dict[str, Any]:
+    store = RunStore(
+        os.environ.get("AGENT_TRUST_DB", str(PROJECT_ROOT / ".agent-trust.sqlite"))
+    )
+    runs = store.list_recent()
+    decisions = [
+        decision
+        for run in runs
+        for decision in run.get("report", {}).get("hybrid_decisions", [])
+        if decision.get("decision")
+    ]
+    counts = {
+        "pass": sum(item.get("decision") == "PASS" for item in decisions),
+        "review": sum(item.get("decision") == "REVIEW" for item in decisions),
+        "fail": sum(item.get("decision") == "FAIL" for item in decisions),
+    }
+    return {
+        "trust_score": (
+            round(100 * counts["pass"] / len(decisions)) if decisions else None
+        ),
+        "decision_counts": counts,
+        "decision_total": len(decisions),
+        "runs": len(runs),
+    }
+
+
+@app.post("/api/media/status")
+def media_status(request: MediaStatusRequest) -> dict[str, Any]:
+    store = RunStore(
+        os.environ.get("AGENT_TRUST_DB", str(PROJECT_ROOT / ".agent-trust.sqlite"))
+    )
+    if store.get(request.run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    store.event(
+        request.run_id,
+        "PLAY_MEDIA",
+        request.status,
+        error_code=request.error_code,
+        verified=request.status == "PLAYING",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    return {"run_id": request.run_id, "status": request.status}
 
 
 @app.post("/api/transcribe", response_model=TranscriptionResponse)
@@ -208,3 +334,9 @@ def approve_run(run_id: str, request: ApprovalRequest) -> dict[str, Any]:
     with _runs_lock:
         _runs[run_id] = resumed
     return _run_payload(resumed)
+
+
+@app.post("/api/approvals/{run_id}/decision")
+def decide_approval(run_id: str, request: ApprovalRequest) -> dict[str, Any]:
+    """Compatibility endpoint for the approval queue."""
+    return approve_run(run_id, request)

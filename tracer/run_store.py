@@ -112,6 +112,22 @@ class RunStore:
         row = self._row(run_id)
         if row is None:
             return None
+        return self._decode_row(row)
+
+    def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return recent persisted runs with decoded timeline and report data."""
+        if limit < 1:
+            raise ValueError("The run limit must be positive.")
+        with sqlite3.connect(self.path) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT * FROM agent_runs ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._decode_row(row) for row in rows]
+
+    @staticmethod
+    def _decode_row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         for key in ("timeline_json", "tool_calls_json", "report_json"):
             result[key[:-5] if key.endswith("_json") else key] = json.loads(

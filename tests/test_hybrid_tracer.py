@@ -323,6 +323,31 @@ def test_low_confidence_review_is_logged_without_human_interrupt() -> None:
     )
 
 
+def test_explicit_youtube_playback_does_not_interrupt_for_human_review() -> None:
+    proposal = StepProposal(
+        user_request="Play music in YouTube",
+        tool_name="youtube_search_and_play",
+        arguments={"query": "music"},
+        step_number=1,
+        risk="MEDIUM",
+    )
+    decision = fuse_decision(
+        evaluate_layer_a(proposal),
+        risk="MEDIUM",
+        anomaly_score=0.9,
+        judge=None,
+        config=FusionConfig(),
+        proposal=proposal,
+    )
+
+    assert decision.verdict == "REVIEW"
+    assert not requires_human_review(
+        decision,
+        tool_name="youtube_search_and_play",
+        config=FusionConfig(),
+    )
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ["create_gmail_draft", "send_gmail_message"],
