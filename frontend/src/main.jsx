@@ -16,7 +16,6 @@ import {
   Mic,
   Moon,
   Play,
-  Search,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -34,19 +33,67 @@ const initialTimeline = [
 ];
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 
-function MetricCard({ label, value, note, tone = "blue", icon: Icon }) {
+function MetricCard({ label, value, note, tone = "blue", icon: Icon, onClick, selected }) {
   return (
-    <article className={`metric-card ${tone}`}>
+    <button className={`metric-card ${tone} ${selected ? "selected" : ""}`} onClick={onClick} type="button">
       <div className="metric-header"><span>{label}</span><Icon size={17} /></div>
       <strong>{value}</strong>
       <small>{note}</small>
-    </article>
+    </button>
   );
 }
 
 function StatusBadge({ status }) {
   const labels = { idle: "Ready", running: "Running", completed: "Completed", review: "Review", failed: "Blocked" };
   return <span className={`status-badge ${status}`}>{labels[status] || status}</span>;
+}
+
+function CheckExplanation({ check }) {
+  const rules = {
+    Grounding: {
+      condition: "Successful source evidence must exist, and answer sentences should cite valid [E#] evidence IDs.",
+      scoring: "Score is the fraction of answer sentences that contain a valid evidence citation. 1.00 is full citation coverage.",
+      why: "This checks whether the response is traceable to recorded tool results. It does not prove that the cited text semantically entails every claim.",
+    },
+    Contradiction: {
+      condition: "The answer is compared with successful evidence for configured opposite status terms such as active/inactive, sent/draft, or succeeded/failed.",
+      scoring: "Score is 1.00 when no configured lexical conflict is found, and 0.25 when a possible conflict is detected. It is not a general semantic contradiction detector.",
+      why: "A warning means the answer and evidence may disagree about the same subject and needs review.",
+    },
+    "Precondition / Postcondition": {
+      condition: "Tool failures are warnings. Gmail draft/send operations are checked only at the API boundary; read-only calls have no remote state change to verify.",
+      scoring: "A failed operation scores 0.00. Read-only or unverified write outcomes are NOT_APPLICABLE rather than being treated as a pass.",
+      why: "This prevents an API acknowledgement from being mistaken for proof that a draft exists or an email was delivered.",
+    },
+    "Scope creep": {
+      condition: "Every tool call must use a source named or permitted by the request, such as Gmail or YouTube.",
+      scoring: "Score is 1.00 when all recorded sources are within the requested scope and 0.00 when an out-of-scope source or tool is used.",
+      why: "A warning indicates the agent may have accessed a source that the user did not ask for.",
+    },
+    "Trajectory anomaly": {
+      condition: "Tool name and arguments are compared across the run; an identical call repeated twice is flagged.",
+      scoring: "Score is 1.00 when no identical call repeats and 0.00 when a repeat is detected.",
+      why: "Repeated identical calls can indicate a loop or unstable execution path, although repetition alone does not prove harm.",
+    },
+    "Self-consistency": {
+      condition: "Two independent answers are normalized and compared using lexical similarity.",
+      scoring: `Score is the normalized text similarity. The current pass threshold is 0.85 (${(check.score ?? 0).toFixed(2)} is this run's score when available).`,
+      why: "A warning means the independent answers differed below the threshold. Paraphrases can score lower even when they agree.",
+    },
+  };
+  const rule = rules[check.name] || {
+    condition: "The recorded trust rule evaluates the available run evidence.",
+    scoring: "The score and status are produced by the backend trust check.",
+    why: "Expand the evidence list to inspect the inputs used for this result.",
+  };
+  return (
+    <div className="check-explanation">
+      <div><b>Condition evaluated</b><p>{rule.condition}</p></div>
+      <div><b>How the score works</b><p>{rule.scoring}</p></div>
+      <div><b>Why this result</b><p>{rule.why} Current status is <strong>{check.status.toUpperCase()}</strong>{check.score != null ? ` with score ${check.score}.` : "."}</p></div>
+      <div><b>Observed evidence</b>{check.evidence?.length ? <ul>{check.evidence.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul> : <p>No evidence items were recorded for this check.</p>}</div>
+    </div>
+  );
 }
 
 function YouTubePlayer({ videoId, title, onStatus }) {
@@ -111,6 +158,9 @@ function App() {
   const [mediaStatus, setMediaStatus] = React.useState("IDLE");
   const [trustMetrics, setTrustMetrics] = React.useState(null);
   const [gmailStatus, setGmailStatus] = React.useState(null);
+  const [theme, setTheme] = React.useState(() => localStorage.getItem("agent-trust-theme") || "dark");
+  const [mobileNavOpen, setMobileNavOpen] = React.useState(false);
+  const [selectedMetric, setSelectedMetric] = React.useState("trust_posture");
   const recorderRef = React.useRef(null);
   const chunksRef = React.useRef([]);
   const stopTimerRef = React.useRef(null);
@@ -145,9 +195,16 @@ function App() {
   }, []);
 
   React.useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("agent-trust-theme", theme);
+  }, [theme]);
+
+  React.useEffect(() => {
     refreshOverview();
     refreshTrustMetrics();
     refreshGmailStatus();
+    const interval = window.setInterval(refreshOverview, 10000);
+    return () => window.clearInterval(interval);
   }, [refreshOverview, refreshTrustMetrics, refreshGmailStatus]);
 
   async function toggleRecording() {
@@ -268,17 +325,30 @@ function App() {
   const resolutionRate = overview?.resolution_rate == null
     ? "--"
     : `${overview.resolution_rate}%`;
+  const updatedAt = overview?.updated_at
+    ? new Date(overview.updated_at).toLocaleString()
+    : "--";
   const mediaAction = run?.media_action;
-  const integrity = trustMetrics?.trust_score ?? postureScore;
+  const integrity = postureScore;
   const statusState = run?.pending_approval
     ? "ATTENTION NEEDED"
     : run?.status === "failed"
       ? "BLOCKED"
       : "VERIFIED";
+  const notificationCount = (overview?.open_reviews || 0) + (overview?.new_critical_alerts || 0);
+  const toggleTheme = () => setTheme((current) => current === "dark" ? "light" : "dark");
+  const showNotifications = () => setActiveView(notificationCount ? "forensics" : "analytics");
+  const metricDetails = overview?.metric_details || {};
+  const metricOptions = [
+    ["active_agents", "Active agents"],
+    ["trust_posture", "Trust posture"],
+    ["open_reviews", "Open reviews"],
+    ["resolution_rate", "Resolution rate"],
+  ];
 
   return (
     <div className="shell">
-      <aside className="sidebar">
+      <aside className={`sidebar ${mobileNavOpen ? "open" : ""}`}>
         <div className="brand"><div className="brand-mark"><ShieldCheck size={19} /></div><div><b>Agent Trust</b><span>TRACER CONSOLE</span></div></div>
         <nav>
           <a className={activeView === "overview" ? "active" : ""} onClick={() => setActiveView("overview")}><LayoutDashboard size={18} />Overview</a>
@@ -292,28 +362,33 @@ function App() {
 
       <main className="main">
         <header className="topbar">
-          <div className="mobile-menu"><Menu size={20} /></div>
-          <div className="searchbox"><Search size={16} /><span>Search runs, agents, policies...</span><kbd>⌘ K</kbd></div>
-          <div className="top-actions"><span className={`connected ${apiConnected ? "" : "disconnected"}`}><i /> {apiConnected ? "API connected" : "API disconnected"}</span><Github size={17} /><Bell size={17} /><Moon size={17} /><div className="avatar">H</div></div>
+          <button className="icon-button mobile-menu" aria-label="Toggle navigation" onClick={() => setMobileNavOpen((open) => !open)}><Menu size={20} /></button>
+          <div className="top-actions">
+            <span className={`connected ${apiConnected ? "" : "disconnected"}`}><i /> {apiConnected ? "API connected" : "API disconnected"}</span>
+            <a className="icon-button" href="https://github.com/harshanavasana/AGENT_TRUST_TRACER" target="_blank" rel="noreferrer" aria-label="Open project on GitHub" title="Open project on GitHub"><Github size={17} /></a>
+            <button className="icon-button notification-button" aria-label={`${notificationCount} notifications`} title={`${notificationCount} notifications`} onClick={showNotifications}><Bell size={17} />{notificationCount > 0 && <span className="notification-badge">{notificationCount > 99 ? "99+" : notificationCount}</span>}</button>
+            <button className="icon-button" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} title="Toggle theme" onClick={toggleTheme}><Moon size={17} /></button>
+            <button className="avatar avatar-button" aria-label="Open settings" title="Open settings" onClick={() => setActiveView("settings")}>H</button>
+          </div>
         </header>
 
         <section className="content">
           <section className={`status-banner ${statusState.toLowerCase().replaceAll(" ", "-")}`}>
             <div className="status-icon"><CheckCircle2 size={26} /></div>
             <div><p className="eyebrow">SYSTEM STATUS</p><h2>STATUS: <strong>{statusState}</strong></h2><p>System integrity confirmed. Agent actions are traced and policy validated.</p></div>
-            <span className="updated-at">Last updated: {new Date().toLocaleString()} <ChevronRight size={14} /></span>
+            <span className="updated-at">Last updated: {updatedAt} <ChevronRight size={14} /></span>
           </section>
           <div className="page-heading"><div><p className="eyebrow">TRUST OPERATIONS / {activeView.toUpperCase()}</p><h1>{activeView === "overview" ? "Agent command center" : activeView === "execution" ? "Live execution" : activeView === "forensics" ? "Run forensics" : activeView === "analytics" ? "Trust analytics" : "Console settings"}</h1><p className="muted">Observe voice requests, safety decisions, and tool execution in one place.</p></div><button className="outline-button" onClick={() => setActiveView("execution")}><Play size={14} /> Replay last run</button></div>
 
           <div className="metrics-grid">
-            <MetricCard label="ACTIVE AGENTS" value={overview?.active_agents ?? "--"} note="Live API status" tone="blue" icon={Activity} />
-            <MetricCard label="TRUST POSTURE" value={integrity} note="Calculated from recorded decisions" tone="green" icon={ShieldCheck} />
-            <MetricCard label="OPEN REVIEWS" value={run?.status === "review" ? "01" : "00"} note="Current run approval state" tone="amber" icon={AlertTriangle} />
-            <MetricCard label="RESOLUTION RATE" value={resolutionRate} note="Calculated from current session runs" tone="violet" icon={CheckCircle2} />
+            <MetricCard label="ACTIVE AGENTS" value={overview?.active_agents ?? "--"} note="Live API status" tone="blue" icon={Activity} onClick={() => { setSelectedMetric("active_agents"); setActiveView("analytics"); }} selected={selectedMetric === "active_agents"} />
+            <MetricCard label="TRUST POSTURE" value={integrity} note="Calculated from recorded decisions" tone="green" icon={ShieldCheck} onClick={() => { setSelectedMetric("trust_posture"); setActiveView("analytics"); }} selected={selectedMetric === "trust_posture"} />
+            <MetricCard label="OPEN REVIEWS" value={overview?.open_reviews ?? "--"} note="Pending approval decisions" tone="amber" icon={AlertTriangle} onClick={() => { setSelectedMetric("open_reviews"); setActiveView("analytics"); }} selected={selectedMetric === "open_reviews"} />
+            <MetricCard label="RESOLUTION RATE" value={resolutionRate} note="Calculated from current session runs" tone="violet" icon={CheckCircle2} onClick={() => { setSelectedMetric("resolution_rate"); setActiveView("analytics"); }} selected={selectedMetric === "resolution_rate"} />
           </div>
 
           {activeView === "forensics" && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">FORENSIC TRACE</p><h2>Step-by-step explanation</h2></div><FileSearch size={18} /></div><div className="explanation-list">{stepExplanations.length ? stepExplanations.map((record, index) => <article className="explanation-item" key={`${record.name}-${index}`}><div className="explanation-index">{index + 1}</div><div><b>{record.name}</b><p>Status: {record.status}</p><small>{record.detail?.reason || record.detail?.rule || record.detail?.decision || "The agent recorded this execution step."}</small></div></article>) : <p className="muted">Run a command to see each agent and trust step explained here.</p>}</div></section>}
-          {activeView === "analytics" && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">TRUST ANALYTICS</p><h2>Decision breakdown</h2></div><Gauge size={18} /></div><div className="analytics-grid">{checks.length ? checks.map((check) => <div className="analytics-card" key={check.check_id || check.name}><span>{check.name}</span><b className={check.status}>{check.status.toUpperCase()}</b><p>{check.explanation || check.reason || "Trust check completed."}</p></div>) : <p className="muted">Trust results appear after the first command.</p>}</div></section>}
+          {activeView === "analytics" && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">TRUST ANALYTICS</p><h2>Metric calculation details</h2></div><Gauge size={18} /></div><label className="metric-selector">Inspect metric<select value={selectedMetric} onChange={(event) => setSelectedMetric(event.target.value)}>{metricOptions.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>{metricDetails[selectedMetric] ? <div className="metric-detail"><b>{metricOptions.find(([key]) => key === selectedMetric)?.[1]}</b><strong>{metricDetails[selectedMetric].value ?? "--"}</strong><p>{metricDetails[selectedMetric].calculation}</p><small>{Object.entries(metricDetails[selectedMetric].inputs || {}).map(([key, value]) => `${key.replaceAll("_", " ")}: ${value}`).join(" • ")}</small></div> : <p className="muted">Metric details appear when the API is connected.</p>}<h3 className="analytics-subheading">Recorded trust checks</h3><div className="analytics-grid">{checks.length ? checks.map((check) => <details className="analytics-card" key={check.check_id || check.name}><summary><span>{check.name}</span><b className={check.status}>{check.status.toUpperCase()}</b></summary><CheckExplanation check={check} /></details>) : <p className="muted">Trust results appear after the first command.</p>}</div></section>}
           {activeView === "settings" && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">CONSOLE SETTINGS</p><h2>Active execution policy</h2></div><Settings size={18} /></div><div className="settings-list"><div><span>Gmail connection</span><b className={gmailStatus?.connected ? "green-text" : ""}>{gmailStatus?.connected ? "Connected" : "Reconnect required"}</b></div><div><span>Gmail scopes</span><b>{gmailStatus?.scopes?.length ? gmailStatus.scopes.map((scope) => scope.split(".").pop()).join(", ") : "Not granted"}</b></div><div><span>Speech model</span><b>openai/whisper-large-v3</b></div><div><span>Voice auto-run</span><b className="green-text">Enabled</b></div><div><span>Playback policy</span><b>Explicit play/watch/listen only</b></div><div><span>Approval policy</span><b>Required for Gmail writes</b></div></div></section>}
           {mediaAction && <section className="panel media-panel"><div className="panel-heading"><div><p className="eyebrow">MEDIA PLAYER</p><h2>{mediaAction.title}</h2></div><span className={`status-badge ${mediaStatus === "PLAYING" ? "completed" : "running"}`}>{mediaStatus}</span></div><div className="player-frame"><YouTubePlayer videoId={mediaAction.video_id} title={mediaAction.title} onStatus={reportMediaStatus} /></div><div className="player-actions"><span><Play size={14} /> Use the player controls to start playback.</span><a href={mediaAction.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Open on YouTube</a><span><Info size={14} /> {mediaStatus === "PLAYING" ? "Playback verified by YouTube." : "Click play if the browser blocks autoplay."}</span></div></section>}
           <div className="workspace-grid">
