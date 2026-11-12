@@ -192,18 +192,52 @@ def overview() -> dict[str, Any]:
         if check_results
         else None
     )
+    review_count = sum(
+        bool(getattr(run, "pending_approval", False)) for run in current_runs
+    )
+    alert_count = sum(
+        check.get("status") in {"warning", "fail"} for check in check_results
+    )
+    completed_count = len(completed_runs)
+    run_count = len(persisted_runs)
     return {
         "active_agents": 1 if any(run.pending_approval for run in current_runs) else 0,
-        "new_critical_alerts": sum(
-            check.get("status") in {"warning", "fail"} for check in check_results
-        ),
+        "open_reviews": review_count,
+        "new_critical_alerts": alert_count,
         "posture_score": posture_score,
         "resolution_rate": (
-            round(100 * len(completed_runs) / len(persisted_runs))
-            if persisted_runs
+            round(100 * completed_count / run_count)
+            if run_count
             else None
         ),
+        "metric_details": {
+            "active_agents": {
+                "value": 1 if any(run.pending_approval for run in current_runs) else 0,
+                "calculation": "Count of in-memory runs waiting for approval.",
+                "inputs": {"active_runs": len(current_runs)},
+            },
+            "trust_posture": {
+                "value": posture_score,
+                "calculation": "Passed checks divided by all recorded checks, multiplied by 100.",
+                "inputs": {"passed_checks": passed_checks, "recorded_checks": len(check_results)},
+            },
+            "open_reviews": {
+                "value": review_count,
+                "calculation": "Count of current runs with a pending approval decision.",
+                "inputs": {"pending_approvals": review_count},
+            },
+            "resolution_rate": {
+                "value": round(100 * completed_count / run_count) if run_count else None,
+                "calculation": "Completed persisted runs divided by all persisted runs, multiplied by 100.",
+                "inputs": {"completed_runs": completed_count, "persisted_runs": run_count},
+            },
+        },
         "latest_run": persisted_runs[0] if persisted_runs else None,
+        "updated_at": (
+            persisted_runs[0].get("updated_at")
+            if persisted_runs
+            else datetime.now(timezone.utc).isoformat()
+        ),
     }
 
 
